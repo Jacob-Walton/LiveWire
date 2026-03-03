@@ -83,6 +83,7 @@
 
 use std::{
     alloc::{Layout, alloc, dealloc},
+    collections::{HashMap, VecDeque},
     fs::File,
     os::windows::fs::FileExt,
 };
@@ -200,7 +201,10 @@ pub struct DirtyBlock {
 
 pub struct LiveWire {
     pub handle: File,
-    // TODO: `io_uring` instance
+    pub pool: HashMap<u64, DirtyBlock>,
+    pub lru_order: VecDeque<u64>,
+    pub capacity: usize, // Max blocks to keep in RAM
+                         // TODO: `io_uring` instance
 }
 
 /// Walton's Constant.
@@ -211,7 +215,12 @@ const WALTONS_CONSTANT: u64 = 0xc47589d5cc327637;
 impl LiveWire {
     /// Create a new LiveWire instance.
     pub fn new(handle: File) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            pool: HashMap::new(),
+            lru_order: VecDeque::new(),
+            capacity: 512,
+        }
     }
 
     /// Where the magic happens. Given a key, it predicts
@@ -243,25 +252,59 @@ impl LiveWire {
         (block, slot)
     }
 
-    pub fn get(&self, key: u64) -> Option<[u8; 55]> {
-        // Where is it?
-        let (block_id, _) = Self::predict_location(key);
-        let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+    pub fn get_or_fetch_block(&mut self, block_id: u64) -> std::io::Result<&mut DirtyBlock> {
+        // Cache Hit
+        if self.pool.contains_key(&block_id) {
+            // Update LRU order (move to back because it's "Hot")
+            self.lru_order.retain(|&x| x != block_id);
+            self.lru_order.push_back(block_id);
+            return Ok(self.pool.get_mut(&block_id).unwrap());
+        }
 
-        // Prepare blank block in memory
+        // Cache Miss
+        // If we're at capacity, kick someone out to make room
+        if self.pool.len() >= self.capacity {
+            if let Some(victim_id) = self.lru_order.pop_front() {
+                if let Some(entry) = self.pool.remove(&victim_id) {
+                    if entry.is_dirty {
+                        let offset = victim_id * (ERASE_BLOCK_SIZE as u64);
+                        self.handle.seek_write(entry.data.as_slice_u8(), offset)?;
+                    }
+                }
+            }
+        }
+
+        // Fetch the new block from the physical metal
         let mut block = AlignedBlock::new();
+        let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+        let _ = self.handle.seek_read(block.as_mut_slice_u8(), offset);
 
-        // Read from the NVMe
-        match self.handle.seek_read(block.as_mut_slice_u8(), offset) {
-            Ok(_) => block.find_slot(key).and_then(|idx| {
-                let slot = &block.slots[idx];
+        self.pool.insert(
+            block_id,
+            DirtyBlock {
+                data: block,
+                is_dirty: false,
+            },
+        );
+        self.lru_order.push_back(block_id);
+
+        Ok(self.pool.get_mut(&block_id).unwrap())
+    }
+
+    pub fn get(&mut self, key: u64) -> Option<[u8; 55]> {
+        let (block_id, _) = Self::predict_location(key);
+
+        if let Ok(entry) = self.get_or_fetch_block(block_id) {
+            entry.data.find_slot(key).and_then(|idx| {
+                let slot = &entry.data.slots[idx];
                 if slot.key == key {
                     Some(slot.payload)
                 } else {
                     None
                 }
-            }),
-            Err(_) => None,
+            })
+        } else {
+            None
         }
     }
 
@@ -273,33 +316,64 @@ impl LiveWire {
     /// - Update master pointer once the write is confirmed
     /// - Makes us virtually immune to data corruption from
     ///   crashes
-    pub fn put(&self, key: u64, data: [u8; 55]) -> std::io::Result<()> {
-        // Find where key should live
+    pub fn put(&mut self, key: u64, data: [u8; 55]) -> std::io::Result<()> {
         let (block_id, _) = Self::predict_location(key);
-        let offset = block_id * (ERASE_BLOCK_SIZE as u64);
 
-        // Pull the block into the Heap (avoiding stack overflow)
-        let mut block = AlignedBlock::new();
+        // Fetch to RAM if not present
+        if !self.pool.contains_key(&block_id) {
+            let mut block = AlignedBlock::new();
+            let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+            let _ = self.handle.seek_read(block.as_mut_slice_u8(), offset);
+            self.pool.insert(
+                block_id,
+                DirtyBlock {
+                    data: block,
+                    is_dirty: false,
+                },
+            );
+        }
 
-        // Read the existing block from disk
-        let read_result = self.handle.seek_read(block.as_mut_slice_u8(), offset);
-
-        // Find a seat using Frog Jump
-        if let Some(slot_idx) = block.find_slot(key) {
-            let slot = &mut block.slots[slot_idx];
+        // Update in RAM
+        let entry = self.pool.get_mut(&block_id).unwrap();
+        if let Some(slot_idx) = entry.data.find_slot(key) {
+            let slot = &mut entry.data.slots[slot_idx];
             slot.key = key;
             slot.payload = data;
-            slot.is_tombstone = false;
-
-            // Slam it back to the NVMe
-            self.handle.seek_write(block.as_slice_u8(), offset)?;
-            self.handle.sync_all()?; // SLAM
+            entry.is_dirty = true; // Mark for slamming later
             Ok(())
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "LiveWire Block Overflow!",
+                "Block Overflow",
             ))
         }
+    }
+
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        for (&block_id, entry) in self.pool.iter_mut() {
+            if entry.is_dirty {
+                let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+                self.handle.seek_write(entry.data.as_slice_u8(), offset)?;
+                entry.is_dirty = false;
+            }
+        }
+        self.handle.sync_all()?;
+        Ok(())
+    }
+}
+
+impl Drop for LiveWire {
+    fn drop(&mut self) {
+        let start = std::time::Instant::now();
+
+        let mut count = 0;
+        for (&block_id, entry) in self.pool.iter_mut() {
+            if entry.is_dirty {
+                let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+                let _ = self.handle.seek_write(entry.data.as_slice_u8(), offset);
+                count += 1;
+            }
+        }
+        let _ = self.handle.sync_all();
     }
 }

@@ -15,9 +15,9 @@ fn main() {
 
     file.set_len(128 * 1024 * 1024).unwrap();
 
-    let live_wire = LiveWire::new(file);
+    let mut live_wire = LiveWire::new(file);
 
-    let iterations = 10_000;
+    let iterations = 1_000_000;
 
     let start = Instant::now();
     for i in 0..iterations {
