@@ -85,6 +85,7 @@ use std::{
     alloc::{Layout, alloc, dealloc},
     collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
+    io::{BufReader, BufWriter, Read, Write},
     os::windows::fs::{FileExt, OpenOptionsExt},
     sync::{
         Arc,
@@ -96,11 +97,12 @@ use std::{
 
 pub use serde_json;
 
+mod bloom;
 mod config;
 mod wal;
 
 // Re-export
-use crate::wal::WalEntry;
+use crate::{bloom::BlockMetadata, wal::WalEntry};
 pub use config::{Durability, LiveWireConfig, WalConfig};
 
 const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
@@ -121,8 +123,7 @@ pub struct WireSlot {
 #[repr(C, align(4096))]
 pub struct WireBlock {
     pub count: u16, // Track how many slots are occupied
-    /// 256KB divided by 64 bytes = exactly 4,096 contiguous slots.
-    pub slots: [WireSlot; 4096],
+    pub slots: [WireSlot; 4095],
 }
 
 impl WireBlock {
@@ -131,9 +132,9 @@ impl WireBlock {
             return Some(start_slot);
         }
 
-        for i in 0..4096 {
+        for i in 0..4095 {
             let jump = i * (i + 1) / 2;
-            let current_slot = (start_slot + jump) % 4096;
+            let current_slot = (start_slot + jump) % 4095;
             let slot = &self.slots[current_slot];
 
             if slot.key == key || slot.key == 0 {
@@ -231,7 +232,8 @@ pub struct LiveWire {
     pub lru_order: VecDeque<u64>,
     pub config: LiveWireConfig,
     pub wal_config: WalConfig,
-    pub flusher_tx: mpsc::Sender<(u64, AlignedBlock)>,
+    pub flusher_tx: Option<mpsc::SyncSender<(u64, AlignedBlock)>>,
+    pub flusher_thread: Option<thread::JoinHandle<()>>,
     /// The channel to send entires to the background WAL thread
     pub wal_tx: Option<SyncSender<(u64, WalEntry)>>,
     /// The WAL background thread
@@ -245,6 +247,8 @@ pub struct LiveWire {
     pub unflushed_puts: u64,
     /// Tracks the count of every block without touching SSD
     pub block_counts: Vec<u16>,
+    /// The global RAM directory for every block on the SSD
+    pub directory: Vec<BlockMetadata>,
     // TODO: `io_uring` instance
 }
 
@@ -276,12 +280,12 @@ impl LiveWire {
             handle.sync_all()?;
         }
 
-        let (tx, rx) = mpsc::channel::<(u64, AlignedBlock)>();
+        let (tx, rx) = mpsc::sync_channel::<(u64, AlignedBlock)>(64);
 
         let bg_handle = handle.try_clone().expect("Failed to clone file handle");
 
         // Spawn the background flusher
-        thread::spawn(move || {
+        let flusher_thread_handle = thread::spawn(move || {
             while let Ok((block_id, block)) = rx.recv() {
                 let offset = block_id * (ERASE_BLOCK_SIZE as u64);
                 // Slow NVMe write happens away from main thread
@@ -315,6 +319,24 @@ impl LiveWire {
 
         let total_blocks = (config.region_count * config.blocks_per_region) as usize;
         let mut block_counts = vec![0u16; total_blocks];
+        let mut directory = vec![BlockMetadata::new(); total_blocks];
+
+        if let Ok(meta_file) = File::open("main.meta") {
+            let mut reader = BufReader::new(meta_file);
+            let mut count_buf = [0u8; 2];
+
+            for i in 0..total_blocks {
+                if reader.read_exact(&mut count_buf).is_err() {
+                    break;
+                }
+                directory[i].count = u16::from_le_bytes(count_buf);
+
+                // Read the bloom filter into the box
+                if reader.read_exact(&mut *directory[i].bloom).is_err() {
+                    break;
+                }
+            }
+        }
 
         // Sweep disk to read block metadata
         let mut count_buffer = [0u8; 2];
@@ -332,13 +354,15 @@ impl LiveWire {
             lru_order: VecDeque::new(),
             config,
             wal_config,
-            flusher_tx: tx,
+            flusher_tx: Some(tx),
+            flusher_thread: Some(flusher_thread_handle),
             wal_tx: Some(wal_tx),
             wal_thread: None, // We will assign this in a second
             global_sequence,
             synced_sequence,
             unflushed_puts: 0,
             block_counts: Vec::new(),
+            directory,
         };
 
         let mut wal_handle_mut = wal_handle.try_clone().unwrap();
@@ -458,7 +482,11 @@ impl LiveWire {
                 }
                 if let Some(entry) = self.pool.remove(&victim_id) {
                     if entry.is_dirty {
-                        let _ = self.flusher_tx.send((victim_id, entry.data));
+                        let _ = self
+                            .flusher_tx
+                            .as_ref()
+                            .unwrap()
+                            .send((victim_id, entry.data));
                     }
                 }
             } else {
@@ -546,16 +574,26 @@ impl LiveWire {
             // Modify the key slightly for each region to ensure a different block
             let effective_key = key ^ (region * WALTONS_CONSTANT);
             let (raw_block_id, start_slot) = self.predict_location(effective_key);
-
-            // Map the block ID into the current 128MB region
             let block_id = (region * 512) + (raw_block_id % 512);
+            let global_idx = block_id as usize;
 
+            // If the block is full and the bloom filter guarantees our key isn't in there,
+            // skip the disk entirely.
+            let should_skip = {
+                let meta = &self.directory[global_idx];
+                meta.count > 3500 && !meta.might_contain(key)
+            };
+
+            if should_skip {
+                continue;
+            }
+
+            // If we get here, either the block has room, or the key is probably updating.
             let entry = self.get_or_fetch_block(block_id)?;
 
             if let Some(slot_idx) = entry.data.find_slot(key, start_slot) {
                 let is_empty_slot = entry.data.slots[slot_idx].key == 0;
 
-                // Only skip if we are trying to insert a brand new key into a full block
                 if is_empty_slot && entry.data.count > 3500 {
                     continue;
                 }
@@ -567,6 +605,12 @@ impl LiveWire {
                 entry.data.slots[slot_idx].key = key;
                 entry.data.slots[slot_idx].payload = data;
                 entry.is_dirty = true;
+
+                if is_empty_slot {
+                    self.directory[global_idx].count += 1;
+                }
+                self.directory[global_idx].insert(key);
+
                 return Ok(());
             }
         }
@@ -597,7 +641,7 @@ impl LiveWire {
                 // Mark the RAM block as clean
                 entry.is_dirty = false;
                 // Toss it to the background thread
-                let _ = self.flusher_tx.send((block_id, snapshot));
+                let _ = self.flusher_tx.as_ref().unwrap().send((block_id, snapshot));
             }
         }
     }
@@ -625,6 +669,7 @@ impl LiveWire {
                         let effective_key = entry.key ^ (region * WALTONS_CONSTANT);
                         let (raw_block_id, start_slot) = self.predict_location(effective_key);
                         let block_id = (region * 512) + (raw_block_id % 512);
+                        let global_idx = block_id as usize;
 
                         if let Ok(block_entry) = self.get_or_fetch_block(block_id) {
                             if block_entry.data.count > 3500 {
@@ -634,15 +679,18 @@ impl LiveWire {
                             if let Some(slot_idx) =
                                 block_entry.data.find_slot(entry.key, start_slot)
                             {
-                                let is_new = block_entry.data.slots[slot_idx].key != entry.key;
-                                if is_new {
-                                    block_entry.data.count += 1;
-                                }
-
+                                let is_empty_slot = block_entry.data.slots[slot_idx].key == 0;
                                 block_entry.data.slots[slot_idx].key = entry.key;
                                 block_entry.data.slots[slot_idx].payload = entry.payload;
                                 block_entry.is_dirty = true;
-                                break; // Successfully recovered this key
+
+                                if is_empty_slot {
+                                    block_entry.data.count += 1;
+                                    self.directory[global_idx].count += 1;
+                                }
+
+                                self.directory[global_idx].insert(entry.key);
+                                break;
                             }
                         }
                     }
@@ -671,6 +719,12 @@ impl Drop for LiveWire {
         }
         let _ = self.handle.sync_all();
 
+        // Kill flusher channel
+        drop(self.flusher_tx.take());
+        if let Some(handle) = self.flusher_thread.take() {
+            let _ = handle.join();
+        }
+
         // Kill the WAL channel
         drop(self.wal_tx.take());
 
@@ -683,6 +737,16 @@ impl Drop for LiveWire {
         let wal_handle = OpenOptions::new().write(true).open("main.wal").unwrap();
         wal_handle.set_len(0).unwrap();
         wal_handle.set_len(16_777_216).unwrap();
+
+        // Save metadata directory
+        let meta_file = File::create("main.meta").expect("Failed to create main.meta");
+        let mut writer = BufWriter::new(meta_file);
+
+        for meta in &self.directory {
+            writer.write_all(&meta.count.to_le_bytes()).unwrap();
+            writer.write_all(&*meta.bloom).unwrap();
+        }
+        writer.flush().unwrap();
     }
 }
 
