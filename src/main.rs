@@ -1,5 +1,6 @@
 use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt, time::Instant};
 
+use colored::Colorize;
 use live_wire::*;
 
 const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
@@ -13,37 +14,127 @@ fn main() {
         .open("main.lw")
         .unwrap();
 
-    file.set_len(128 * 1024 * 1024).unwrap();
+    let live_wire_config = LiveWireConfig::default();
+    let wal_config = WalConfig {
+        mode: Durability::Async,
+        max_batch_size: 64,
+    };
+    let live_wire =
+        LiveWire::new(file, live_wire_config, wal_config).expect("Failed to initialize LiveWire");
+    let mut store = JsonStore::new(live_wire);
 
-    let mut live_wire = LiveWire::new(file);
+    // Small documents (fit inline, < 50 bytes)
+    let small_docs = vec![
+        ("user:1", serde_json::json!({"name": "Alice", "age": 30})),
+        ("user:2", serde_json::json!({"name": "Bob", "age": 25})),
+        ("user:3", serde_json::json!({"name": "Charlie", "age": 35})),
+    ];
 
-    let iterations = 1_000_000;
+    // Larger document (overflows into extra slots)
+    let large_doc = serde_json::json!({
+        "id": 1001,
+        "name": "Warehouse Alpha",
+        "location": {
+            "city": "Manchester",
+            "country": "United Kingdom",
+            "postcode": "M1 1AA"
+        },
+        "inventory": [
+            {"sku": "WR-001", "name": "Widget", "qty": 5000},
+            {"sku": "GZ-042", "name": "Gizmo", "qty": 1200},
+            {"sku": "TH-099", "name": "Thingamajig", "qty": 300}
+        ],
+        "active": true
+    });
 
-    let start = Instant::now();
-    for i in 0..iterations {
-        let mut data = [0u8; 55];
-        data[0] = (i % 255) as u8;
-        live_wire.put(i as u64, data).unwrap();
+    println!("{}", "Writing small documents".bold());
+    for (key, doc) in &small_docs {
+        store.put(key, doc).unwrap();
+        let serialized = serde_json::to_vec(doc).unwrap();
+        println!("  {} -> {} bytes", key, serialized.len());
     }
-    let duration = start.elapsed();
+
+    println!("\n{}", "Writing large document".bold());
+    let serialized = serde_json::to_vec(&large_doc).unwrap();
+    println!("  warehouse:1 -> {} bytes", serialized.len());
+    store.put("warehouse:1", &large_doc).unwrap();
+
+    println!("\n{}", "Reading back".bold());
+    for (key, _) in &small_docs {
+        let result = store.get(key);
+        println!("  {} -> {}", key, result.unwrap());
+    }
+
+    let result = store.get("warehouse:1");
+    println!("  warehouse:1 -> {}", result.unwrap());
+
+    // Verify a missing key
+    let missing = store.get("nonexistent");
+    println!("\n  nonexistent -> {:?}", missing);
+
+    // Sustained load test
+    let total = 10_000_000;
+    let batch = 1_000_000;
+
     println!(
-        "Puts: {} iterations in {:?}, ({:?} per op)",
-        iterations,
-        duration,
-        duration / iterations as u32
+        "\n{}",
+        format!("Sustained load: {} JSON documents\n", total).bold()
     );
 
-    let start = Instant::now();
-    for i in 0..iterations {
-        live_wire.get(i as u64).unwrap();
+    // Puts in batches
+    let overall_start = Instant::now();
+    for b in 0..(total / batch) {
+        let start = Instant::now();
+        for i in (b * batch)..((b + 1) * batch) {
+            let doc = serde_json::json!({"id": i, "val": i * 7});
+            let key = format!("bench:{}", i);
+            store.put(&key, &doc).unwrap();
+        }
+        let dur = start.elapsed();
+        let so_far = (b + 1) * batch;
+        println!(
+            "  PUT batch {}/{}: {:?} ({:?}/op) | {} total written",
+            b + 1,
+            total / batch,
+            dur,
+            dur / batch as u32,
+            so_far
+        );
     }
-    let duration = start.elapsed();
+    let put_total = overall_start.elapsed();
     println!(
-        "Gets: {} iterations in {:?}, ({:?} per op)",
-        iterations,
-        duration,
-        duration / iterations as u32
+        "\n  PUT total: {:?} ({:?}/op)\n",
+        put_total,
+        put_total / total as u32
     );
 
-    std::fs::remove_file("main.lw").unwrap();
+    // Gets in batches
+    let overall_start = Instant::now();
+    for b in 0..(total / batch) {
+        let start = Instant::now();
+        for i in (b * batch)..((b + 1) * batch) {
+            let key = format!("bench:{}", i);
+            store.get(&key).unwrap();
+        }
+        let dur = start.elapsed();
+        let so_far = (b + 1) * batch;
+        println!(
+            "  GET batch {}/{}: {:?} ({:?}/op) | {} total read",
+            b + 1,
+            total / batch,
+            dur,
+            dur / batch as u32,
+            so_far
+        );
+    }
+    let get_total = overall_start.elapsed();
+    println!(
+        "\n  GET total: {:?} ({:?}/op)",
+        get_total,
+        get_total / total as u32
+    );
+
+    store.sync().unwrap();
+
+    // std::fs::remove_file("main.lw").unwrap();
 }
