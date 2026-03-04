@@ -313,6 +313,19 @@ impl LiveWire {
             wal_handle.set_len(16_777_216).unwrap();
         }
 
+        let total_blocks = (config.region_count * config.blocks_per_region) as usize;
+        let mut block_counts = vec![0u16; total_blocks];
+
+        // Sweep disk to read block metadata
+        let mut count_buffer = [0u8; 2];
+        for i in 0..total_blocks {
+            let offset = (i * ERASE_BLOCK_SIZE) as u64;
+            // We only need to read the first 2 bytes
+            if let Ok(_) = handle.seek_read(&mut count_buffer, offset) {
+                block_counts[i] = u16::from_le_bytes(count_buffer);
+            }
+        }
+
         let mut engine = Self {
             handle,
             pool: HashMap::new(),
@@ -325,6 +338,7 @@ impl LiveWire {
             global_sequence,
             synced_sequence,
             unflushed_puts: 0,
+            block_counts: Vec::new(),
         };
 
         let mut wal_handle_mut = wal_handle.try_clone().unwrap();
@@ -392,19 +406,6 @@ impl LiveWire {
         });
 
         engine.wal_thread = Some(wal_thread_handle);
-
-        let total_blocks = (config.region_count * config.blocks_per_region) as usize;
-        let mut block_counts = vec![0u16; total_blocks];
-
-        // Sweep disk to read block metadata
-        let mut count_buffer = [0u8; 2];
-        for i in 0..total_blocks {
-            let offset = (i * ERASE_BLOCK_SIZE) as u64;
-            // We only need to read the first 2 bytes
-            if let Ok(_) = handle.seek_read(&mut count_buffer, offset) {
-                block_counts[i] = u16::from_le_bytes(count_buffer);
-            }
-        }
 
         Ok(engine)
     }

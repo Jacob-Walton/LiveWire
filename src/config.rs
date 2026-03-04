@@ -1,4 +1,4 @@
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct LiveWireConfig {
     /// How many 265KB blocks to keep in RAM.
     /// 4096 = 1GB of RAM.
