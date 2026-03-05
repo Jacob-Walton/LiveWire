@@ -20,7 +20,7 @@ fn main() {
         ..Default::default()
     };
     let wal_config = WalConfig {
-        mode: Durability::Async,
+        mode: Durability::Strict,
         max_batch_size: 8192,
     };
 
