@@ -3,6 +3,15 @@ name = "live_wire"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "test"
+path = "src/main.rs"
+
+[lib]
+name = "live_wire"
+path = "src/lib.rs"
+
 [dependencies]
 colored = "3.1.1"
+libc = "0.2.182"
 serde_json = "1"

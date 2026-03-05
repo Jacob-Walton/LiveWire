@@ -23,6 +23,8 @@ All entries are exactly 64 bytes which means that one slot = one CPU cache line.
 - **PUT**: ~16µs/op (sustained)
 - **GET**: ~884ns/op (sustained)
 
+## Stats (M4 / External SSD)
+
 ## Trade-offs
 
 Because we can only optimise for two of three things (Read, Update, Memory),

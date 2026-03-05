@@ -1,18 +1,31 @@
-use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt, time::Instant};
+use std::{fs::OpenOptions, time::Instant};
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use colored::Colorize;
 use live_wire::*;
 
-const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
-
 fn main() {
+    #[cfg(windows)]
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .read(true)
-        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .custom_flags(live_wire::FILE_FLAG_NO_BUFFERING)
         .open("main.lw")
         .unwrap();
+
+    #[cfg(unix)]
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .open("main.lw")
+        .unwrap();
+
+    #[cfg(unix)]
+    enable_direct_io(&file).unwrap();
 
     let live_wire_config = LiveWireConfig::default();
     let wal_config = WalConfig {

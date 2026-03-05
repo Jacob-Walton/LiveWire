@@ -86,7 +86,6 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
-    os::windows::fs::{FileExt, OpenOptionsExt},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -95,17 +94,25 @@ use std::{
     thread,
 };
 
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
+pub use crate::file::*;
+
 pub use serde_json;
 
 mod bloom;
 mod config;
+mod file;
 mod wal;
 
 // Re-export
-use crate::{bloom::BlockMetadata, wal::WalEntry};
+use crate::{
+    bloom::BlockMetadata,
+    file::{seek_read, seek_write},
+    wal::WalEntry,
+};
 pub use config::{Durability, LiveWireConfig, WalConfig};
-
-const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
 
 const ERASE_BLOCK_SIZE: usize = 262_144; // 256KB
 
@@ -289,7 +296,7 @@ impl LiveWire {
             while let Ok((block_id, block)) = rx.recv() {
                 let offset = block_id * (ERASE_BLOCK_SIZE as u64);
                 // Slow NVMe write happens away from main thread
-                let _ = bg_handle.seek_write(block.as_slice_u8(), offset);
+                let _ = seek_write(&bg_handle, block.as_slice_u8(), offset);
                 // NOTE: We don't `sync_all()` here to keep throughput high.
                 // The OS should flush the hardware buffer.
             }
@@ -305,6 +312,7 @@ impl LiveWire {
         // Clone the Atomic for the background thread
         let bg_synced_sequence = Arc::clone(&synced_sequence);
 
+        #[cfg(windows)]
         let wal_handle = OpenOptions::new()
             .create(true)
             .write(true)
@@ -312,6 +320,16 @@ impl LiveWire {
             .custom_flags(FILE_FLAG_NO_BUFFERING)
             .open("main.wal")
             .unwrap();
+
+        #[cfg(unix)]
+        let wal_handle = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open("main.wal")
+            .unwrap();
+
+        // TODO: Unix flag
 
         if wal_handle.metadata().unwrap().len() < 16_777_216 {
             wal_handle.set_len(16_777_216).unwrap();
@@ -343,7 +361,7 @@ impl LiveWire {
         for i in 0..total_blocks {
             let offset = (i * ERASE_BLOCK_SIZE) as u64;
             // We only need to read the first 2 bytes
-            if let Ok(_) = handle.seek_read(&mut count_buffer, offset) {
+            if let Ok(_) = seek_read(&handle, &mut count_buffer, offset) {
                 block_counts[i] = u16::from_le_bytes(count_buffer);
             }
         }
@@ -411,9 +429,8 @@ impl LiveWire {
                     let write_slice = std::slice::from_raw_parts(io_buffer as *const u8, 4096);
 
                     // Slam it
-                    wal_handle
-                        .seek_write(write_slice, current_wal_offset)
-                        .expect("Fatal Error: WAL write failed!");
+                    seek_write(&wal_handle, write_slice, current_wal_offset)
+                        .expect("Fatal Error: WAL write failed");
                 }
 
                 // Move forward 1 NVMe page (4KB)
@@ -497,7 +514,7 @@ impl LiveWire {
         // Fetch the new block
         let mut block = AlignedBlock::new();
         let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-        let _ = self.handle.seek_read(block.as_mut_slice_u8(), offset);
+        let _ = seek_read(&self.handle, block.as_mut_slice_u8(), offset);
 
         self.pool.insert(
             block_id,
@@ -625,7 +642,7 @@ impl LiveWire {
         for (&block_id, entry) in self.pool.iter_mut() {
             if entry.is_dirty {
                 let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-                self.handle.seek_write(entry.data.as_slice_u8(), offset)?;
+                seek_write(&self.handle, entry.data.as_slice_u8(), offset)?;
                 entry.is_dirty = false;
             }
         }
@@ -652,7 +669,7 @@ impl LiveWire {
 
         for page in 0..4096 {
             let offset = page * 4096;
-            let bytes_read = wal_handle.seek_read(&mut read_buffer, offset).unwrap();
+            let bytes_read = seek_read(&wal_handle, &mut read_buffer, offset).unwrap();
             if bytes_read < 4096 {
                 continue;
             }
@@ -714,7 +731,7 @@ impl Drop for LiveWire {
         for (&block_id, entry) in self.pool.iter_mut() {
             if entry.is_dirty {
                 let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-                let _ = self.handle.seek_write(entry.data.as_slice_u8(), offset);
+                let _ = seek_write(&self.handle, entry.data.as_slice_u8(), offset);
             }
         }
         let _ = self.handle.sync_all();
