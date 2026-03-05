@@ -1,39 +1,28 @@
-use std::{fs::OpenOptions, time::Instant};
-
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
+use std::{env, path::PathBuf, time::Instant};
 
 use colored::Colorize;
 use live_wire::*;
 
 fn main() {
-    #[cfg(windows)]
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .custom_flags(live_wire::FILE_FLAG_NO_BUFFERING)
-        .open("main.lw")
-        .unwrap();
+    let data_path: PathBuf = env::var("LIVE_WIRE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./data"));
+    let abs_path = if data_path.is_absolute() {
+        data_path
+    } else {
+        env::current_dir().unwrap().join(data_path)
+    };
 
-    #[cfg(unix)]
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open("main.lw")
-        .unwrap();
-
-    #[cfg(unix)]
-    enable_direct_io(&file).unwrap();
-
-    let live_wire_config = LiveWireConfig::default();
+    let live_wire_config = LiveWireConfig {
+        data_dir: abs_path,
+        ..Default::default()
+    };
     let wal_config = WalConfig {
         mode: Durability::Async,
         max_batch_size: 64,
     };
     let live_wire =
-        LiveWire::new(file, live_wire_config, wal_config).expect("Failed to initialize LiveWire");
+        LiveWire::new(live_wire_config, wal_config).expect("Failed to initialize LiveWire");
     let mut store = JsonStore::new(live_wire);
 
     // Small documents (fit inline, < 50 bytes)

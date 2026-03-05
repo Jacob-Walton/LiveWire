@@ -1,4 +1,6 @@
-#[derive(Clone, Copy, Debug)]
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug)]
 pub struct LiveWireConfig {
     /// How many 265KB blocks to keep in RAM.
     /// 4096 = 1GB of RAM.
@@ -13,6 +15,9 @@ pub struct LiveWireConfig {
 
     /// How many operations before we automatically flush dirty blocks to disk
     pub auto_sync_threshold: u64,
+
+    /// Directory to store files in
+    pub data_dir: PathBuf,
 }
 
 impl Default for LiveWireConfig {
@@ -22,6 +27,7 @@ impl Default for LiveWireConfig {
             blocks_per_region: 512, // 128MB regions
             region_count: 32,       // 4GB total disk space
             auto_sync_threshold: 50_000,
+            data_dir: PathBuf::from("./data"),
         }
     }
 }

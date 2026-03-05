@@ -91,7 +91,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender},
     },
-    thread,
+    thread::{self, JoinHandle},
 };
 
 #[cfg(windows)]
@@ -122,7 +122,7 @@ const ERASE_BLOCK_SIZE: usize = 262_144; // 256KB
 pub struct WireSlot {
     pub key: u64,           // 8 bytes
     pub is_tombstone: bool, // 1 byte (very wasteful, but fast)
-    pub payload: [u8; 55],  // 55 bytes of raw, wasted data to fill our 64 bytes
+    pub payload: [u8; 55],  // 55 bytes of raw data to fill our 64 bytes
 }
 
 /// Represents a 256KB chunk mapped directly to the SSD's erase block.
@@ -256,7 +256,6 @@ pub struct LiveWire {
     pub block_counts: Vec<u16>,
     /// The global RAM directory for every block on the SSD
     pub directory: Vec<BlockMetadata>,
-    // TODO: `io_uring` instance
 }
 
 /// Walton's Constant.
@@ -266,11 +265,32 @@ const WALTONS_CONSTANT: u64 = 0xc47589d5cc327637;
 
 impl LiveWire {
     /// Create a new LiveWire instance.
-    pub fn new(
-        handle: File,
-        config: LiveWireConfig,
-        wal_config: WalConfig,
-    ) -> std::io::Result<Self> {
+    pub fn new(config: LiveWireConfig, wal_config: WalConfig) -> std::io::Result<Self> {
+        if !config.data_dir.exists() {
+            std::fs::create_dir_all(&config.data_dir).expect("failed to create data dir");
+        }
+
+        let lw_path = config.data_dir.join("main.lw");
+        #[cfg(windows)]
+        let handle = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .custom_flags(crate::FILE_FLAG_NO_BUFFERING)
+            .open(lw_path)
+            .unwrap();
+
+        #[cfg(unix)]
+        let handle = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(lw_path)
+            .unwrap();
+
+        #[cfg(unix)]
+        enable_direct_io(&handle).unwrap();
+
         // Check size of handle, compare to config, adjust accordingly
         let expected_size =
             config.region_count * config.blocks_per_region * (ERASE_BLOCK_SIZE as u64);
@@ -287,20 +307,73 @@ impl LiveWire {
             handle.sync_all()?;
         }
 
-        let (tx, rx) = mpsc::sync_channel::<(u64, AlignedBlock)>(64);
-
         let bg_handle = handle.try_clone().expect("Failed to clone file handle");
+        let mut flusher_thread_handle: Option<JoinHandle<()>> = None;
 
-        // Spawn the background flusher
-        let flusher_thread_handle = thread::spawn(move || {
-            while let Ok((block_id, block)) = rx.recv() {
-                let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-                // Slow NVMe write happens away from main thread
-                let _ = seek_write(&bg_handle, block.as_slice_u8(), offset);
-                // NOTE: We don't `sync_all()` here to keep throughput high.
-                // The OS should flush the hardware buffer.
-            }
-        });
+        let mut tx = None;
+
+        #[cfg(target_os = "linux")]
+        {
+            use io_uring::{IoUring, opcode, types};
+            use std::os::unix::io::AsRawFd;
+
+            let (tx_inner, rx_inner) = mpsc::sync_channel::<(u64, AlignedBlock)>(128);
+            tx = Some(tx_inner);
+            let receiver = rx_inner;
+
+            let fd = bg_handle.as_raw_fd();
+
+            flusher_thread_handle = Some(thread::spawn(move || {
+                let mut ring = IoUring::new(256).expect("Failed to init io_uring");
+
+                while let Ok((block_id, block)) = receiver.recv() {
+                    let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+
+                    // Build a raw write entry
+                    let write_e = opcode::Write::new(
+                        types::Fd(fd),
+                        block.ptr as *const u8,
+                        ERASE_BLOCK_SIZE as u32,
+                    )
+                    .offset(offset)
+                    .build()
+                    .user_data(block_id); // Tag it for later identification
+
+                    unsafe {
+                        // Push to submission queue
+                        ring.submission()
+                            .push(&write_e)
+                            .expect("submission queue full");
+                    }
+
+                    // Tell the kernel to process the queue
+                    ring.submit().expect("uring submit failed");
+
+                    // TODO: Instead of waiting here, we could submit n blocks at
+                    // a time and only reap the completion queue once the ring is
+                    // getting full.
+                }
+            }))
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (tx_inner, rx_inner) = mpsc::sync_channel::<(u64, AlignedBlock)>(64);
+
+            tx = Some(tx_inner);
+            rx = Some(rx_inner);
+
+            // Spawn the background flusher
+            flusher_thread_handle = Some(thread::spawn(move || {
+                while let Ok((block_id, block)) = rx.take().unwrap().recv() {
+                    let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+                    // Slow NVMe write happens away from main thread
+                    let _ = seek_write(&bg_handle, block.as_slice_u8(), offset);
+                    // NOTE: We don't `sync_all()` here to keep throughput high.
+                    // The OS should flush the hardware buffer.
+                }
+            }));
+        }
 
         // Initialize WAL atomics
         let global_sequence = Arc::new(AtomicU64::new(0));
@@ -312,13 +385,15 @@ impl LiveWire {
         // Clone the Atomic for the background thread
         let bg_synced_sequence = Arc::clone(&synced_sequence);
 
+        let wal_path = config.data_dir.join("main.wal");
+
         #[cfg(windows)]
         let wal_handle = OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
             .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open("main.wal")
+            .open(wal_path)
             .unwrap();
 
         #[cfg(unix)]
@@ -326,10 +401,8 @@ impl LiveWire {
             .create(true)
             .write(true)
             .read(true)
-            .open("main.wal")
+            .open(wal_path)
             .unwrap();
-
-        // TODO: Unix flag
 
         if wal_handle.metadata().unwrap().len() < 16_777_216 {
             wal_handle.set_len(16_777_216).unwrap();
@@ -339,7 +412,8 @@ impl LiveWire {
         let mut block_counts = vec![0u16; total_blocks];
         let mut directory = vec![BlockMetadata::new(); total_blocks];
 
-        if let Ok(meta_file) = File::open("main.meta") {
+        let meta_path = config.data_dir.join("main.meta");
+        if let Ok(meta_file) = File::open(meta_path) {
             let mut reader = BufReader::new(meta_file);
             let mut count_buf = [0u8; 2];
 
@@ -372,8 +446,8 @@ impl LiveWire {
             lru_order: VecDeque::new(),
             config,
             wal_config,
-            flusher_tx: Some(tx),
-            flusher_thread: Some(flusher_thread_handle),
+            flusher_tx: tx,
+            flusher_thread: flusher_thread_handle,
             wal_tx: Some(wal_tx),
             wal_thread: None, // We will assign this in a second
             global_sequence,
@@ -530,7 +604,7 @@ impl LiveWire {
 
     pub fn get(&mut self, key: u64) -> Option<[u8; 55]> {
         for region in 0..self.config.region_count {
-            let effective_key = key ^ (region * WALTONS_CONSTANT);
+            let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
             let (raw_block_id, start_slot) = self.predict_location(effective_key);
             let block_id = (region * 512) + (raw_block_id % 512);
 
@@ -589,7 +663,7 @@ impl LiveWire {
         // We try every region until we find a block with an empty slot
         for region in 0..self.config.region_count {
             // Modify the key slightly for each region to ensure a different block
-            let effective_key = key ^ (region * WALTONS_CONSTANT);
+            let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
             let (raw_block_id, start_slot) = self.predict_location(effective_key);
             let block_id = (region * 512) + (raw_block_id % 512);
             let global_idx = block_id as usize;
@@ -683,7 +757,7 @@ impl LiveWire {
 
                     // Inject directly into engine
                     for region in 0..self.config.region_count {
-                        let effective_key = entry.key ^ (region * WALTONS_CONSTANT);
+                        let effective_key = entry.key ^ (region.wrapping_mul(WALTONS_CONSTANT));
                         let (raw_block_id, start_slot) = self.predict_location(effective_key);
                         let block_id = (region * 512) + (raw_block_id % 512);
                         let global_idx = block_id as usize;
@@ -751,7 +825,8 @@ impl Drop for LiveWire {
         }
 
         // Wipe the WAL file clean
-        let wal_handle = OpenOptions::new().write(true).open("main.wal").unwrap();
+        let wal_path = self.config.data_dir.join("main.wal");
+        let wal_handle = OpenOptions::new().write(true).open(wal_path).unwrap();
         wal_handle.set_len(0).unwrap();
         wal_handle.set_len(16_777_216).unwrap();
 

@@ -2,3 +2,4 @@
 *.lw
 *.wal
 *.meta
+.stignore
