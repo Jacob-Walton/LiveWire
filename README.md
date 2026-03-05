@@ -13,17 +13,25 @@ All entries are exactly 64 bytes which means that one slot = one CPU cache line.
 
 ## Stats (7950X3D / Gen5 NVMe)
 
-### Async
+### Async (Windows)
 
 - **PUT**: ~572ns/op (sustained)
 - **GET**: ~926ns/op (sustained)
 
-### Strict
+### Strict (Windows)
 
 - **PUT**: ~16µs/op (sustained)
 - **GET**: ~884ns/op (sustained)
 
-## Stats (M4 / External SSD)
+### Async (Linux)
+
+- **PUT**: ~
+- **GET**: ~
+
+### Strict (Linux)
+
+- **PUT**: ~
+- **GET**: ~
 
 ## Trade-offs
 

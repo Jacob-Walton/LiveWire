@@ -83,13 +83,12 @@
 
 use std::{
     alloc::{Layout, alloc, dealloc},
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
 };
@@ -116,6 +115,8 @@ pub use config::{Durability, LiveWireConfig, WalConfig};
 
 const ERASE_BLOCK_SIZE: usize = 262_144; // 256KB
 
+pub const TOMBSTONE_LEY: u64 = 0xFFFFFFFFFFFFFFFF;
+
 /// Represents a single, predictable 64-byte slot.
 /// Fits perfectly into one L1/L2/L3 cache line.
 #[repr(C, align(64))]
@@ -136,7 +137,7 @@ pub struct WireBlock {
 impl WireBlock {
     pub fn find_slot(&self, key: u64, start_slot: usize) -> Option<usize> {
         if self.count == 0 && key != 0 {
-            return Some(start_slot);
+            return Some(start_slot % 4095);
         }
 
         for i in 0..4095 {
@@ -228,34 +229,32 @@ impl Clone for AlignedBlock {
 // Let Rust know it's safe to send this to another thread
 unsafe impl Send for AlignedBlock {}
 
+// Tells Rust it's safe for other threads to see this pointer
+unsafe impl Sync for AlignedBlock {}
+
 pub struct DirtyBlock {
     pub data: AlignedBlock,
     pub is_dirty: bool,
+    pub last_access: u64,
+}
+
+pub struct Shard {
+    pub pool: HashMap<u64, DirtyBlock>,
+    pub directory: Vec<BlockMetadata>,
+    pub access_counter: AtomicU64,
 }
 
 pub struct LiveWire {
-    pub handle: File,
-    pub pool: HashMap<u64, DirtyBlock>,
-    pub lru_order: VecDeque<u64>,
+    pub handle: Arc<File>,
+    pub shards: Vec<Arc<parking_lot::RwLock<Shard>>>,
     pub config: LiveWireConfig,
     pub wal_config: WalConfig,
-    pub flusher_tx: Option<mpsc::SyncSender<(u64, AlignedBlock)>>,
     pub flusher_thread: Option<thread::JoinHandle<()>>,
-    /// The channel to send entires to the background WAL thread
-    pub wal_tx: Option<SyncSender<(u64, WalEntry)>>,
-    /// The WAL background thread
-    pub wal_thread: Option<thread::JoinHandle<()>>,
-    /// The global counter of every operation ever requested
-    pub global_sequence: Arc<AtomicU64>,
-    /// The counter updated only by the background thread
-    /// when data hits the metal
-    pub synced_sequence: Arc<AtomicU64>,
-    /// Tracks how many puts since the last background sync
-    pub unflushed_puts: u64,
-    /// Tracks the count of every block without touching SSD
-    pub block_counts: Vec<u16>,
-    /// The global RAM directory for every block on the SSD
-    pub directory: Vec<BlockMetadata>,
+    pub wal_threads: Vec<thread::JoinHandle<()>>,
+    pub flusher_txs: Vec<crossbeam_channel::Sender<(u64, AlignedBlock)>>,
+    pub wal_txs: Vec<crossbeam_channel::Sender<(u64, WalEntry)>>,
+    pub global_seqs: Vec<Arc<AtomicU64>>,
+    pub synced_seqs: Vec<Arc<AtomicU64>>,
 }
 
 /// Walton's Constant.
@@ -291,236 +290,147 @@ impl LiveWire {
         #[cfg(unix)]
         enable_direct_io(&handle).unwrap();
 
-        // Check size of handle, compare to config, adjust accordingly
         let expected_size =
             config.region_count * config.blocks_per_region * (ERASE_BLOCK_SIZE as u64);
-        let current_size = handle
-            .metadata()
-            .expect("Failed to read file metadata")
-            .len();
-        if current_size < expected_size {
-            handle
-                .set_len(expected_size)
-                .expect("Failed to pre-allocate disk space! Check disk capacity.");
-
-            // Force the OS to update
+        if handle.metadata()?.len() < expected_size {
+            handle.set_len(expected_size)?;
             handle.sync_all()?;
         }
 
         let bg_handle = handle.try_clone().expect("Failed to clone file handle");
-        let mut flusher_thread_handle: Option<JoinHandle<()>> = None;
-
-        let mut tx = None;
-
-        #[cfg(target_os = "linux")]
-        {
-            use io_uring::{IoUring, opcode, types};
-            use std::os::unix::io::AsRawFd;
-
-            let (tx_inner, rx_inner) = mpsc::sync_channel::<(u64, AlignedBlock)>(128);
-            tx = Some(tx_inner);
-            let receiver = rx_inner;
-
-            let fd = bg_handle.as_raw_fd();
-
-            flusher_thread_handle = Some(thread::spawn(move || {
-                let mut ring = IoUring::new(256).expect("Failed to init io_uring");
-
-                while let Ok((block_id, block)) = receiver.recv() {
-                    let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-
-                    // Build a raw write entry
-                    let write_e = opcode::Write::new(
-                        types::Fd(fd),
-                        block.ptr as *const u8,
-                        ERASE_BLOCK_SIZE as u32,
-                    )
-                    .offset(offset)
-                    .build()
-                    .user_data(block_id); // Tag it for later identification
-
-                    unsafe {
-                        // Push to submission queue
-                        ring.submission()
-                            .push(&write_e)
-                            .expect("submission queue full");
-                    }
-
-                    // Tell the kernel to process the queue
-                    ring.submit().expect("uring submit failed");
-
-                    // TODO: Instead of waiting here, we could submit n blocks at
-                    // a time and only reap the completion queue once the ring is
-                    // getting full.
-                }
-            }))
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let (tx_inner, rx_inner) = mpsc::sync_channel::<(u64, AlignedBlock)>(64);
-
-            tx = Some(tx_inner);
-            rx = Some(rx_inner);
-
-            // Spawn the background flusher
-            flusher_thread_handle = Some(thread::spawn(move || {
-                while let Ok((block_id, block)) = rx.take().unwrap().recv() {
-                    let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-                    // Slow NVMe write happens away from main thread
-                    let _ = seek_write(&bg_handle, block.as_slice_u8(), offset);
-                    // NOTE: We don't `sync_all()` here to keep throughput high.
-                    // The OS should flush the hardware buffer.
-                }
-            }));
-        }
-
-        // Initialize WAL atomics
-        let global_sequence = Arc::new(AtomicU64::new(0));
-        let synced_sequence = Arc::new(AtomicU64::new(0));
-
-        // Create the Channel (bounded to 65,536 pending operations)
-        let (wal_tx, wal_rx) = mpsc::sync_channel::<(u64, WalEntry)>(65_536);
-
-        // Clone the Atomic for the background thread
-        let bg_synced_sequence = Arc::clone(&synced_sequence);
-
-        let wal_path = config.data_dir.join("main.wal");
-
-        #[cfg(windows)]
-        let wal_handle = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .custom_flags(FILE_FLAG_NO_BUFFERING)
-            .open(wal_path)
-            .unwrap();
-
-        #[cfg(unix)]
-        let wal_handle = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open(wal_path)
-            .unwrap();
-
-        if wal_handle.metadata().unwrap().len() < 16_777_216 {
-            wal_handle.set_len(16_777_216).unwrap();
-        }
 
         let total_blocks = (config.region_count * config.blocks_per_region) as usize;
-        let mut block_counts = vec![0u16; total_blocks];
-        let mut directory = vec![BlockMetadata::new(); total_blocks];
+        let num_shards = config.num_shards.max(1);
+        let blocks_per_shard = total_blocks / num_shards;
 
+        let mut engine = Self {
+            handle: Arc::new(handle),
+            shards: Vec::with_capacity(num_shards),
+            config: config.clone(),
+            wal_config: wal_config.clone(),
+            flusher_thread: None,
+            wal_threads: Vec::with_capacity(num_shards),
+            flusher_txs: Vec::with_capacity(num_shards),
+            wal_txs: Vec::with_capacity(num_shards),
+            global_seqs: Vec::with_capacity(num_shards),
+            synced_seqs: Vec::with_capacity(num_shards),
+        };
+
+        let mut shard_receivers = Vec::with_capacity(num_shards);
+
+        for i in 0..num_shards {
+            let (f_tx, f_rx) = crossbeam_channel::bounded::<(u64, AlignedBlock)>(128);
+            let (w_tx, w_rx) = crossbeam_channel::bounded::<(u64, WalEntry)>(65_536);
+            shard_receivers.push(f_rx);
+
+            let synced_seq = Arc::new(AtomicU64::new(0));
+            let global_seq = Arc::new(AtomicU64::new(0));
+            let bg_synced = Arc::clone(&synced_seq);
+
+            let shard_wal_path = config.data_dir.join(format!("shard_{}.wal", i));
+            let wal_handle = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .open(&shard_wal_path)?;
+            wal_handle.set_len(16_777_216)?;
+            let thread_batch_size = wal_config.max_batch_size;
+
+            let wal_thread = thread::spawn(move || {
+                let mut batch = Vec::with_capacity(thread_batch_size);
+                let mut current_wal_offset = 0u64;
+
+                // Dynamic sizing based on max_batch_size
+                let entry_size = std::mem::size_of::<WalEntry>();
+                let max_bytes = thread_batch_size * entry_size;
+
+                // Round up to the nearest 4KB page for O_DIRECT alignment
+                let alloc_size = (max_bytes + 4095) & !4095;
+
+                let layout = std::alloc::Layout::from_size_align(alloc_size, 4096).unwrap();
+                let io_buffer = unsafe { std::alloc::alloc_zeroed(layout) as *mut WalEntry };
+
+                while let Ok((seq_id, entry)) = w_rx.recv() {
+                    batch.push((seq_id, entry));
+
+                    while batch.len() < thread_batch_size {
+                        match w_rx.try_recv() {
+                            Ok((s, e)) => batch.push((s, e)),
+                            _ => break,
+                        }
+                    }
+
+                    // Calculate exactly how many 4KB pages we need for this specific batch
+                    let write_bytes = batch.len() * entry_size;
+                    let write_pages = (write_bytes + 4095) & !4095;
+
+                    unsafe {
+                        // Only zero out the pages we are about to use to save CPU cycles
+                        std::ptr::write_bytes(io_buffer as *mut u8, 0, write_pages);
+
+                        for (idx, (_, e)) in batch.iter().enumerate() {
+                            std::ptr::write(io_buffer.add(idx), *e);
+                        }
+
+                        let slice = std::slice::from_raw_parts(io_buffer as *const u8, write_pages);
+                        seek_write(&wal_handle, slice, current_wal_offset).expect("WAL write fail");
+                    }
+
+                    current_wal_offset = (current_wal_offset + write_pages as u64) % 16_777_216;
+                    bg_synced.store(batch.last().unwrap().0, Ordering::Release);
+                    batch.clear();
+                }
+
+                unsafe {
+                    std::alloc::dealloc(io_buffer as *mut u8, layout);
+                }
+            });
+
+            engine.wal_threads.push(wal_thread);
+            engine.flusher_txs.push(f_tx);
+            engine.wal_txs.push(w_tx);
+            engine.synced_seqs.push(synced_seq);
+            engine.global_seqs.push(global_seq);
+
+            engine.shards.push(Arc::new(parking_lot::RwLock::new(Shard {
+                pool: HashMap::default(),
+                directory: vec![BlockMetadata::new(); blocks_per_shard],
+                access_counter: AtomicU64::new(0),
+            })));
+        }
+
+        // Start global flusher
+        #[cfg(target_os = "linux")]
+        {
+            engine.flusher_thread = Some(Self::start_linux_flusher(bg_handle, shard_receivers));
+        }
+
+        // Load metadata into shards
         let meta_path = config.data_dir.join("main.meta");
         if let Ok(meta_file) = File::open(meta_path) {
             let mut reader = BufReader::new(meta_file);
             let mut count_buf = [0u8; 2];
-
-            for i in 0..total_blocks {
-                if reader.read_exact(&mut count_buf).is_err() {
-                    break;
-                }
-                directory[i].count = u16::from_le_bytes(count_buf);
-
-                // Read the bloom filter into the box
-                if reader.read_exact(&mut *directory[i].bloom).is_err() {
-                    break;
+            for shard_lock in &engine.shards {
+                let mut shard = shard_lock.write();
+                for i in 0..blocks_per_shard {
+                    if reader.read_exact(&mut count_buf).is_err() {
+                        break;
+                    }
+                    shard.directory[i].count = u16::from_le_bytes(count_buf);
+                    if reader.read_exact(&mut *shard.directory[i].bloom).is_err() {
+                        break;
+                    }
                 }
             }
         }
 
-        // Sweep disk to read block metadata
-        let mut count_buffer = [0u8; 2];
-        for i in 0..total_blocks {
-            let offset = (i * ERASE_BLOCK_SIZE) as u64;
-            // We only need to read the first 2 bytes
-            if let Ok(_) = seek_read(&handle, &mut count_buffer, offset) {
-                block_counts[i] = u16::from_le_bytes(count_buffer);
+        // Sharded recovery
+        for i in 0..num_shards {
+            let shard_wal_path = config.data_dir.join(format!("shard_{}.wal", i));
+            if let Ok(mut wal_file) = File::open(shard_wal_path) {
+                engine.recover_from_wal_shard(i, &mut wal_file);
             }
         }
-
-        let mut engine = Self {
-            handle,
-            pool: HashMap::new(),
-            lru_order: VecDeque::new(),
-            config,
-            wal_config,
-            flusher_tx: tx,
-            flusher_thread: flusher_thread_handle,
-            wal_tx: Some(wal_tx),
-            wal_thread: None, // We will assign this in a second
-            global_sequence,
-            synced_sequence,
-            unflushed_puts: 0,
-            block_counts: Vec::new(),
-            directory,
-        };
-
-        let mut wal_handle_mut = wal_handle.try_clone().unwrap();
-        engine.recover_from_wal(&mut wal_handle_mut);
-
-        let thread_batch_size = engine.wal_config.max_batch_size;
-
-        // Spawn WAL thread
-        let wal_thread_handle = thread::spawn(move || {
-            // Batching buffer
-            let mut batch = Vec::with_capacity(thread_batch_size);
-            let mut current_wal_offset = 0u64;
-
-            let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
-            let io_buffer = unsafe { std::alloc::alloc_zeroed(layout) as *mut WalEntry };
-
-            // Blocks until first `put` happens
-            while let Ok((seq_id, entry)) = wal_rx.recv() {
-                batch.push((seq_id, entry));
-
-                // Greedy Grab loop
-                // Instantly drain any other pending items up to our 4KB limit
-                while batch.len() < thread_batch_size {
-                    match wal_rx.try_recv() {
-                        Ok((next_seq, next_entry)) => batch.push((next_seq, next_entry)),
-                        Err(mpsc::TryRecvError::Empty) => break, // Queue is empty
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            if batch.is_empty() {
-                                return;
-                            }
-                            break;
-                        } // Shutting down
-                    }
-                }
-
-                unsafe {
-                    // Fast pad
-                    std::ptr::write_bytes(io_buffer as *mut u8, 0, 4096);
-
-                    // Flat copy
-                    for (i, (_seq, entry)) in batch.iter().enumerate() {
-                        std::ptr::write(io_buffer.add(i), *entry);
-                    }
-
-                    // Slice it for I/O
-                    let write_slice = std::slice::from_raw_parts(io_buffer as *const u8, 4096);
-
-                    // Slam it
-                    seek_write(&wal_handle, write_slice, current_wal_offset)
-                        .expect("Fatal Error: WAL write failed");
-                }
-
-                // Move forward 1 NVMe page (4KB)
-                current_wal_offset += 4096;
-                current_wal_offset %= 16_777_216;
-
-                // Update the Atomic counter to release any spin-waiting main threads
-                let highest_seq_in_batch = batch.last().unwrap().0;
-                bg_synced_sequence.store(highest_seq_in_batch, Ordering::Release);
-
-                // Clear the buffer for next burst
-                batch.clear();
-            }
-        });
-
-        engine.wal_thread = Some(wal_thread_handle);
 
         Ok(engine)
     }
@@ -548,67 +458,78 @@ impl LiveWire {
         let scrambled = key.wrapping_mul(WALTONS_CONSTANT);
         let folded = scrambled ^ (scrambled >> 32);
 
-        let slot = (folded & 4095) as usize;
+        let slot = (folded % 4095) as usize;
         let block = (folded >> 12) % self.config.blocks_per_region;
 
         (block, slot)
     }
 
-    pub fn get_or_fetch_block(&mut self, block_id: u64) -> std::io::Result<&mut DirtyBlock> {
-        // Cache Hit
-        if self.pool.contains_key(&block_id) {
-            // We skip the O(n) retain and just push a duplicate.
-            // Duplicates are handled lazily during eviction.
-            self.lru_order.push_back(block_id);
-            return Ok(self.pool.get_mut(&block_id).unwrap());
+    pub fn get_or_fetch_block<'a>(
+        &self,
+        shard: &'a mut Shard,
+        shard_idx: usize,
+        block_id: u64,
+        local_idx: usize,
+    ) -> std::io::Result<&'a mut DirtyBlock> {
+        if shard.pool.contains_key(&block_id) {
+            let entry = shard.pool.get_mut(&block_id).unwrap();
+            entry.last_access = shard.access_counter.fetch_add(1, Ordering::Relaxed);
+            return Ok(entry);
         }
 
-        // Cache Miss
-        // If we're at capacity, kick someone out to make room
-        while self.pool.len() >= self.config.pool_capacity {
-            if let Some(victim_id) = self.lru_order.pop_front() {
-                // Skip stale duplicates
-                if !self.pool.contains_key(&victim_id) {
-                    continue;
-                }
-                if let Some(entry) = self.pool.remove(&victim_id) {
+        let capacity = self.config.pool_capacity / self.shards.len();
+        if shard.pool.len() >= capacity {
+            let victim_id = shard
+                .pool
+                .iter()
+                .take(16)
+                .min_by_key(|(_, b)| b.last_access)
+                .map(|(&id, _)| id);
+
+            if let Some(vid) = victim_id {
+                if let Some(entry) = shard.pool.remove(&vid) {
                     if entry.is_dirty {
-                        let _ = self
-                            .flusher_tx
-                            .as_ref()
-                            .unwrap()
-                            .send((victim_id, entry.data));
+                        let _ = self.flusher_txs[shard_idx].send((vid, entry.data));
                     }
                 }
-            } else {
-                break;
             }
         }
 
-        // Fetch the new block
         let mut block = AlignedBlock::new();
-        let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-        let _ = seek_read(&self.handle, block.as_mut_slice_u8(), offset);
+        if shard.directory[local_idx].count > 0 {
+            let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+            let _ = seek_read(&self.handle, block.as_mut_slice_u8(), offset);
+        }
 
-        self.pool.insert(
+        let access = shard.access_counter.fetch_add(1, Ordering::Relaxed);
+        shard.pool.insert(
             block_id,
             DirtyBlock {
                 data: block,
                 is_dirty: false,
+                last_access: access,
             },
         );
-        self.lru_order.push_back(block_id);
 
-        Ok(self.pool.get_mut(&block_id).unwrap())
+        Ok(shard.pool.get_mut(&block_id).unwrap())
     }
 
-    pub fn get(&mut self, key: u64) -> Option<[u8; 55]> {
+    pub fn get(&self, key: u64) -> Option<[u8; 55]> {
+        let num_shards = self.shards.len();
+        let shard_idx = (key % num_shards as u64) as usize;
+        let mut shard = self.shards[shard_idx].write();
+
+        let total_blocks = self.config.region_count * self.config.blocks_per_region;
+        let blocks_per_shard = (total_blocks / num_shards as u64) as usize;
+
         for region in 0..self.config.region_count {
             let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
             let (raw_block_id, start_slot) = self.predict_location(effective_key);
-            let block_id = (region * 512) + (raw_block_id % 512);
 
-            if let Ok(entry) = self.get_or_fetch_block(block_id) {
+            let local_idx = (raw_block_id as usize) % blocks_per_shard;
+            let block_id = (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+
+            if let Ok(entry) = self.get_or_fetch_block(&mut shard, shard_idx, block_id, local_idx) {
                 if let Some(idx) = entry.data.find_slot(key, start_slot) {
                     let slot = &entry.data.slots[idx];
 
@@ -617,9 +538,7 @@ impl LiveWire {
                         return Some(slot.payload);
                     }
 
-                    // Exit early if:
-                    // We found an empty slot AND the block isn't "Full".
-                    // If the block is "Full" (> 3500), the key might be in the NEXT region.
+                    // Exit early if we found an empty slot AND the block isn't "Full".
                     if slot.key == 0 && entry.data.count <= 3500 {
                         return None;
                     }
@@ -637,41 +556,40 @@ impl LiveWire {
     /// - Update master pointer once the write is confirmed
     /// - Makes us virtually immune to data corruption from
     ///   crashes
-    pub fn put(&mut self, key: u64, data: [u8; 55]) -> std::io::Result<()> {
-        // Get a unique ID for this operation
-        let seq_id = self.global_sequence.fetch_add(1, Ordering::Relaxed);
+    pub fn put(&self, key: u64, data: [u8; 55]) -> std::io::Result<()> {
+        let shard_idx = (key % self.shards.len() as u64) as usize;
 
-        let entry = WalEntry {
-            key,
-            is_tombstone: false,
-            payload: data,
-        };
+        let seq_id = self.global_seqs[shard_idx].fetch_add(1, Ordering::Relaxed);
+        let _ = self.wal_txs[shard_idx].send((
+            seq_id,
+            WalEntry {
+                key,
+                is_tombstone: false,
+                payload: data,
+            },
+        ));
 
-        // Send to background thread's queue
-        let _ = self.wal_tx.as_ref().unwrap().send((seq_id, entry));
-
-        // Durability check
+        // Durability wait
         if self.wal_config.mode == Durability::Strict {
-            // Spin-wait. The CPU burns cycles checking the atomic
-            // variable. It's incredibly fast because the variable stays
-            // in the L3 cache until the background thread modifies it.
-            while self.synced_sequence.load(Ordering::Acquire) < seq_id {
-                std::hint::spin_loop(); // Tells the CPU we are waiting, saves power
+            let synced_ptr = &self.synced_seqs[shard_idx];
+            while synced_ptr.load(Ordering::Acquire) < seq_id {
+                std::hint::spin_loop();
             }
         }
 
-        // We try every region until we find a block with an empty slot
+        let mut shard = self.shards[shard_idx].write();
+
         for region in 0..self.config.region_count {
-            // Modify the key slightly for each region to ensure a different block
             let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
             let (raw_block_id, start_slot) = self.predict_location(effective_key);
-            let block_id = (region * 512) + (raw_block_id % 512);
-            let global_idx = block_id as usize;
 
-            // If the block is full and the bloom filter guarantees our key isn't in there,
-            // skip the disk entirely.
+            let total_blocks = self.config.region_count * self.config.blocks_per_region;
+            let blocks_per_shard = (total_blocks / self.shards.len() as u64) as usize;
+            let local_idx = (raw_block_id as usize) % blocks_per_shard;
+            let global_block_id = (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+
             let should_skip = {
-                let meta = &self.directory[global_idx];
+                let meta = &shard.directory[local_idx];
                 meta.count > 3500 && !meta.might_contain(key)
             };
 
@@ -679,12 +597,11 @@ impl LiveWire {
                 continue;
             }
 
-            // If we get here, either the block has room, or the key is probably updating.
-            let entry = self.get_or_fetch_block(block_id)?;
+            let entry =
+                self.get_or_fetch_block(&mut shard, shard_idx, global_block_id, local_idx)?;
 
             if let Some(slot_idx) = entry.data.find_slot(key, start_slot) {
                 let is_empty_slot = entry.data.slots[slot_idx].key == 0;
-
                 if is_empty_slot && entry.data.count > 3500 {
                     continue;
                 }
@@ -692,15 +609,14 @@ impl LiveWire {
                 if is_empty_slot {
                     entry.data.count += 1;
                 }
-
                 entry.data.slots[slot_idx].key = key;
                 entry.data.slots[slot_idx].payload = data;
                 entry.is_dirty = true;
 
                 if is_empty_slot {
-                    self.directory[global_idx].count += 1;
+                    shard.directory[local_idx].count += 1;
                 }
-                self.directory[global_idx].insert(key);
+                shard.directory[local_idx].insert(key);
 
                 return Ok(());
             }
@@ -712,12 +628,15 @@ impl LiveWire {
         ))
     }
 
-    pub fn sync(&mut self) -> std::io::Result<()> {
-        for (&block_id, entry) in self.pool.iter_mut() {
-            if entry.is_dirty {
-                let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-                seek_write(&self.handle, entry.data.as_slice_u8(), offset)?;
-                entry.is_dirty = false;
+    pub fn sync(&self) -> std::io::Result<()> {
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock.write();
+            for (&block_id, entry) in shard.pool.iter_mut() {
+                if entry.is_dirty {
+                    let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+                    seek_write(&self.handle, entry.data.as_slice_u8(), offset)?;
+                    entry.is_dirty = false;
+                }
             }
         }
         self.handle.sync_all()?;
@@ -725,25 +644,30 @@ impl LiveWire {
     }
 
     pub fn background_sync(&mut self) {
-        for (&block_id, entry) in self.pool.iter_mut() {
-            if entry.is_dirty {
-                // Take memory snapshot
-                let snapshot = entry.data.clone();
-                // Mark the RAM block as clean
-                entry.is_dirty = false;
-                // Toss it to the background thread
-                let _ = self.flusher_tx.as_ref().unwrap().send((block_id, snapshot));
+        for (shard_idx, shard_lock) in self.shards.iter().enumerate() {
+            let mut shard = shard_lock.write();
+            for (&block_id, entry) in shard.pool.iter_mut() {
+                if entry.is_dirty {
+                    let snapshot = entry.data.clone();
+                    entry.is_dirty = false;
+                    let _ = self.flusher_txs[shard_idx].send((block_id, snapshot));
+                }
             }
         }
     }
 
-    fn recover_from_wal(&mut self, wal_handle: &mut File) {
+    fn recover_from_wal_shard(&mut self, shard_idx: usize, wal_handle: &mut File) {
         let mut recovered_keys = 0;
         let mut read_buffer = [0u8; 4096];
+        let shard_arc = &self.shards[shard_idx];
+        let mut shard = shard_arc.write();
+
+        let total_blocks = (self.config.region_count * self.config.blocks_per_region) as usize;
+        let blocks_per_shard = total_blocks / self.shards.len();
 
         for page in 0..4096 {
-            let offset = page * 4096;
-            let bytes_read = seek_read(&wal_handle, &mut read_buffer, offset).unwrap();
+            let offset = (page * 4096) as u64;
+            let bytes_read = seek_read(wal_handle, &mut read_buffer, offset).unwrap();
             if bytes_read < 4096 {
                 continue;
             }
@@ -752,17 +676,22 @@ impl LiveWire {
 
             for entry in entries.iter() {
                 if entry.key != 0 {
-                    // We found data that survived a crash
                     recovered_keys += 1;
 
-                    // Inject directly into engine
                     for region in 0..self.config.region_count {
                         let effective_key = entry.key ^ (region.wrapping_mul(WALTONS_CONSTANT));
                         let (raw_block_id, start_slot) = self.predict_location(effective_key);
-                        let block_id = (region * 512) + (raw_block_id % 512);
-                        let global_idx = block_id as usize;
 
-                        if let Ok(block_entry) = self.get_or_fetch_block(block_id) {
+                        let local_idx = (raw_block_id as usize) % blocks_per_shard;
+                        let global_block_id =
+                            (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+
+                        if let Ok(block_entry) = self.get_or_fetch_block(
+                            &mut shard,
+                            shard_idx,
+                            global_block_id,
+                            local_idx,
+                        ) {
                             if block_entry.data.count > 3500 {
                                 continue;
                             }
@@ -771,16 +700,17 @@ impl LiveWire {
                                 block_entry.data.find_slot(entry.key, start_slot)
                             {
                                 let is_empty_slot = block_entry.data.slots[slot_idx].key == 0;
+
                                 block_entry.data.slots[slot_idx].key = entry.key;
                                 block_entry.data.slots[slot_idx].payload = entry.payload;
                                 block_entry.is_dirty = true;
 
                                 if is_empty_slot {
                                     block_entry.data.count += 1;
-                                    self.directory[global_idx].count += 1;
+                                    shard.directory[local_idx].count += 1;
                                 }
 
-                                self.directory[global_idx].insert(entry.key);
+                                shard.directory[local_idx].insert(entry.key);
                                 break;
                             }
                         }
@@ -790,55 +720,273 @@ impl LiveWire {
         }
 
         if recovered_keys > 0 {
-            // Force a sync to move recovered data into main file
-            let _ = self.sync();
-            // Wipe the WAL clean so we don't recover it twice
-            wal_handle.set_len(0).unwrap();
-            wal_handle.set_len(16_777_216).unwrap();
+            println!(
+                "Shard {}: Recovered {} keys from WAL",
+                shard_idx, recovered_keys
+            );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_linux_flusher(
+        bg_handle: File,
+        receivers: Vec<crossbeam_channel::Receiver<(u64, AlignedBlock)>>,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            use io_uring::IoUring;
+            use std::os::unix::io::AsRawFd;
+
+            let mut ring: IoUring = IoUring::builder()
+                .setup_sqpoll(2000)
+                .build(256)
+                .expect("failed to init uring");
+
+            let fd = bg_handle.as_raw_fd();
+            let mut in_flight: HashMap<u64, AlignedBlock> = HashMap::new();
+
+            loop {
+                let mut activity = false;
+                let mut active_channels = 0;
+
+                // Check every shard's private pipe
+                for rx in &receivers {
+                    loop {
+                        match rx.try_recv() {
+                            Ok((id, block)) => {
+                                activity = true;
+                                active_channels += 1;
+                                Self::push_to_ring(&mut ring, &mut in_flight, fd, id, block);
+
+                                // Prevent the ring from overflowing
+                                if in_flight.len() >= 128 {
+                                    let _ = ring.submit_and_wait(1);
+                                    Self::reap_completions(&mut ring, &mut in_flight);
+                                }
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                active_channels += 1;
+                                break;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                break; // Sender was dropped in LiveWire::drop
+                            }
+                        }
+                    }
+                }
+
+                if activity {
+                    let _ = ring.submit();
+                    Self::reap_completions(&mut ring, &mut in_flight);
+                } else {
+                    Self::reap_completions(&mut ring, &mut in_flight);
+
+                    // Shutdown cleanly when the engine drops
+                    if active_channels == 0 && in_flight.is_empty() {
+                        break;
+                    }
+
+                    if in_flight.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn push_to_ring(
+        ring: &mut io_uring::IoUring,
+        in_flight: &mut HashMap<u64, AlignedBlock>,
+        fd: i32,
+        id: u64,
+        block: AlignedBlock,
+    ) {
+        let offset = id * (ERASE_BLOCK_SIZE as u64);
+        let write_e = io_uring::opcode::Write::new(
+            io_uring::types::Fd(fd),
+            block.ptr as *const u8,
+            ERASE_BLOCK_SIZE as u32,
+        )
+        .offset(offset)
+        .build()
+        .user_data(id);
+
+        unsafe {
+            let _ = ring.submission().push(&write_e);
+        }
+        in_flight.insert(id, block);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reap_completions(ring: &mut io_uring::IoUring, in_flight: &mut HashMap<u64, AlignedBlock>) {
+        let mut cq = ring.completion();
+        while let Some(cqe) = cq.next() {
+            in_flight.remove(&cqe.user_data());
+        }
+    }
+
+    /// Puts the data into the engine and returns the sequence ID for later syncing
+    pub fn put_async(&self, key: u64, data: [u8; 55]) -> std::io::Result<(usize, u64)> {
+        let shard_idx = (key % self.shards.len() as u64) as usize;
+
+        let seq_id = self.global_seqs[shard_idx].fetch_add(1, Ordering::Relaxed);
+        let _ = self.wal_txs[shard_idx].send((
+            seq_id,
+            WalEntry {
+                key,
+                is_tombstone: false,
+                payload: data,
+            },
+        ));
+
+        // Do the memory insert immediately without waiting for disk
+        let mut shard = self.shards[shard_idx].write();
+        self.insert_to_memory(&mut shard, shard_idx, key, data)?;
+
+        Ok((shard_idx, seq_id))
+    }
+
+    /// Vectorized memory insert. Grabs the RwLock once for an entire batch of documents.
+    pub fn put_batch(&self, shard_idx: usize, entries: &[(u64, [u8; 55])]) -> std::io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Queue all to WAL lock-free
+        let start_seq =
+            self.global_seqs[shard_idx].fetch_add(entries.len() as u64, Ordering::Relaxed);
+        for (i, &(key, payload)) in entries.iter().enumerate() {
+            let _ = self.wal_txs[shard_idx].send((
+                start_seq + i as u64,
+                WalEntry {
+                    key,
+                    is_tombstone: false,
+                    payload,
+                },
+            ));
+        }
+
+        // One lock for the entire batch
+        let mut shard = self.shards[shard_idx].write();
+        for &(key, payload) in entries {
+            self.insert_to_memory(&mut shard, shard_idx, key, payload)?;
+        }
+
+        Ok(())
+    }
+
+    /// Waits for a specific sequence ID to hit the metal
+    pub fn wait_sync(&self, shard_idx: usize, seq_id: u64) {
+        let synced_ptr = &self.synced_seqs[shard_idx];
+        while synced_ptr.load(Ordering::Acquire) < seq_id {
+            // Yield the core so the WAL thread can actually run
+            std::thread::yield_now();
+        }
+    }
+
+    fn insert_to_memory(
+        &self,
+        shard: &mut parking_lot::RwLockWriteGuard<'_, Shard>,
+        shard_idx: usize,
+        key: u64,
+        data: [u8; 55],
+    ) -> std::io::Result<()> {
+        for region in 0..self.config.region_count {
+            let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
+            let (raw_block_id, start_slot) = self.predict_location(effective_key);
+
+            let total_blocks = self.config.region_count * self.config.blocks_per_region;
+            let blocks_per_shard = (total_blocks / self.shards.len() as u64) as usize;
+            let local_idx = (raw_block_id as usize) % blocks_per_shard;
+            let global_block_id = (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+
+            let should_skip = {
+                let meta = &shard.directory[local_idx];
+                meta.count > 3500 && !meta.might_contain(key)
+            };
+
+            if should_skip {
+                continue;
+            }
+
+            let entry = self.get_or_fetch_block(shard, shard_idx, global_block_id, local_idx)?;
+
+            if let Some(slot_idx) = entry.data.find_slot(key, start_slot) {
+                let is_empty_slot = entry.data.slots[slot_idx].key == 0;
+                if is_empty_slot && entry.data.count > 3500 {
+                    continue;
+                }
+
+                if is_empty_slot {
+                    entry.data.count += 1;
+                }
+                entry.data.slots[slot_idx].key = key;
+                entry.data.slots[slot_idx].payload = data;
+                entry.is_dirty = true;
+
+                if is_empty_slot {
+                    shard.directory[local_idx].count += 1;
+                }
+                shard.directory[local_idx].insert(key);
+
+                return Ok(());
+            }
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Total Database Overflow!",
+        ))
     }
 }
 
 impl Drop for LiveWire {
     fn drop(&mut self) {
-        // Flush all dirty blocks to main.lw
-        for (&block_id, entry) in self.pool.iter_mut() {
-            if entry.is_dirty {
-                let offset = block_id * (ERASE_BLOCK_SIZE as u64);
-                let _ = seek_write(&self.handle, entry.data.as_slice_u8(), offset);
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock.write();
+            for (&block_id, entry) in shard.pool.iter_mut() {
+                if entry.is_dirty {
+                    let offset = block_id * (ERASE_BLOCK_SIZE as u64);
+                    let _ = seek_write(&self.handle, entry.data.as_slice_u8(), offset);
+                    entry.is_dirty = false;
+                }
             }
         }
         let _ = self.handle.sync_all();
 
-        // Kill flusher channel
-        drop(self.flusher_tx.take());
+        self.flusher_txs.clear();
         if let Some(handle) = self.flusher_thread.take() {
             let _ = handle.join();
         }
 
-        // Kill the WAL channel
-        drop(self.wal_tx.take());
-
-        // Wait for the WAL thread to finish
-        if let Some(handle) = self.wal_thread.take() {
+        self.wal_txs.clear();
+        for handle in self.wal_threads.drain(..) {
             let _ = handle.join();
         }
 
-        // Wipe the WAL file clean
         let wal_path = self.config.data_dir.join("main.wal");
-        let wal_handle = OpenOptions::new().write(true).open(wal_path).unwrap();
-        wal_handle.set_len(0).unwrap();
-        wal_handle.set_len(16_777_216).unwrap();
-
-        // Save metadata directory
-        let meta_file = File::create("main.meta").expect("Failed to create main.meta");
-        let mut writer = BufWriter::new(meta_file);
-
-        for meta in &self.directory {
-            writer.write_all(&meta.count.to_le_bytes()).unwrap();
-            writer.write_all(&*meta.bloom).unwrap();
+        if let Ok(wal_handle) = OpenOptions::new().write(true).open(wal_path) {
+            let _ = wal_handle.set_len(0);
+            let _ = wal_handle.set_len(16_777_216);
         }
-        writer.flush().unwrap();
+
+        let meta_path = self.config.data_dir.join("main.meta");
+        if let Ok(meta_file) = File::create(meta_path) {
+            let mut writer = BufWriter::new(meta_file);
+
+            for shard_lock in &self.shards {
+                let shard = shard_lock.read();
+                for meta in &shard.directory {
+                    if let Err(_) = writer.write_all(&meta.count.to_le_bytes()) {
+                        break;
+                    }
+                    if let Err(_) = writer.write_all(&*meta.bloom) {
+                        break;
+                    }
+                }
+            }
+            let _ = writer.flush();
+        }
     }
 }
 
@@ -866,11 +1014,11 @@ fn overflow_key(base_key: u64, index: u64) -> u64 {
 }
 
 pub struct JsonStore {
-    pub inner: LiveWire,
+    pub inner: Arc<LiveWire>,
 }
 
 impl JsonStore {
-    pub fn new(inner: LiveWire) -> Self {
+    pub fn new(inner: Arc<LiveWire>) -> Self {
         Self { inner }
     }
 
@@ -880,7 +1028,6 @@ impl JsonStore {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let total_len = serialized.len() as u32;
 
-        // Build the head slot payload
         let mut payload = [0u8; 55];
         let inline_len = serialized.len().min(INLINE_DATA_SIZE);
         payload[0] = if serialized.len() > INLINE_DATA_SIZE {
@@ -893,7 +1040,6 @@ impl JsonStore {
 
         self.inner.put(hash, payload)?;
 
-        // Write overflow chunks if needed
         if serialized.len() > INLINE_DATA_SIZE {
             let remaining = &serialized[INLINE_DATA_SIZE..];
             for (i, chunk) in remaining.chunks(OVERFLOW_CHUNK_SIZE).enumerate() {
@@ -907,7 +1053,7 @@ impl JsonStore {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+    pub fn get(&self, key: &str) -> Option<serde_json::Value> {
         let hash = fnv1a(key);
         let payload = self.inner.get(hash)?;
 
@@ -941,13 +1087,11 @@ impl JsonStore {
     pub fn delete(&mut self, key: &str) -> std::io::Result<()> {
         let hash = fnv1a(key);
 
-        // Read the head to find overflow chunks
         if let Some(payload) = self.inner.get(hash) {
             let flags = payload[0];
             let total_len =
                 u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
 
-            // Tombstone overflow chunks
             if flags == FLAG_OVERFLOW && total_len > INLINE_DATA_SIZE {
                 let remaining = total_len - INLINE_DATA_SIZE;
                 let num_chunks = (remaining + OVERFLOW_CHUNK_SIZE - 1) / OVERFLOW_CHUNK_SIZE;
@@ -957,7 +1101,6 @@ impl JsonStore {
                 }
             }
 
-            // Tombstone the head
             self.inner.put(hash, [0u8; 55])?;
         }
 

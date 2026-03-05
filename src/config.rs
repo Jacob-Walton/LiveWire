@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct LiveWireConfig {
@@ -18,16 +18,20 @@ pub struct LiveWireConfig {
 
     /// Directory to store files in
     pub data_dir: PathBuf,
+
+    /// Number of shards to use
+    pub num_shards: usize,
 }
 
 impl Default for LiveWireConfig {
     fn default() -> Self {
         Self {
-            pool_capacity: 4096,    // 1GB memory footprint
+            pool_capacity: 8129,    // 2GB memory footprint
             blocks_per_region: 512, // 128MB regions
             region_count: 32,       // 4GB total disk space
             auto_sync_threshold: 50_000,
             data_dir: PathBuf::from("./data"),
+            num_shards: 16,
         }
     }
 }
