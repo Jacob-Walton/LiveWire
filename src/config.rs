@@ -26,7 +26,7 @@ pub struct LiveWireConfig {
 impl Default for LiveWireConfig {
     fn default() -> Self {
         Self {
-            pool_capacity: 8129,    // 2GB memory footprint
+            pool_capacity: 8192,    // 2GB memory footprint
             blocks_per_region: 512, // 128MB regions
             region_count: 32,       // 4GB total disk space
             auto_sync_threshold: 50_000,
@@ -54,7 +54,7 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             mode: Durability::Strict,
-            max_batch_size: 64,
+            max_batch_size: 128,
         }
     }
 }

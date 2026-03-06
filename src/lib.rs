@@ -90,7 +90,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    thread::{self, JoinHandle},
+    thread,
 };
 
 #[cfg(windows)]
@@ -115,7 +115,7 @@ pub use config::{Durability, LiveWireConfig, WalConfig};
 
 const ERASE_BLOCK_SIZE: usize = 262_144; // 256KB
 
-pub const TOMBSTONE_LEY: u64 = 0xFFFFFFFFFFFFFFFF;
+pub const TOMBSTONE_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
 
 /// Represents a single, predictable 64-byte slot.
 /// Fits perfectly into one L1/L2/L3 cache line.
@@ -191,6 +191,12 @@ impl AlignedBlock {
         }
 
         Self { ptr }
+    }
+}
+
+impl Default for AlignedBlock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -284,6 +290,7 @@ impl LiveWire {
             .create(true)
             .write(true)
             .read(true)
+            .truncate(false)
             .open(lw_path)
             .unwrap();
 
@@ -297,7 +304,7 @@ impl LiveWire {
             handle.sync_all()?;
         }
 
-        let bg_handle = handle.try_clone().expect("Failed to clone file handle");
+        let _ = handle.try_clone().expect("Failed to clone file handle");
 
         let total_blocks = (config.region_count * config.blocks_per_region) as usize;
         let num_shards = config.num_shards.max(1);
@@ -307,7 +314,7 @@ impl LiveWire {
             handle: Arc::new(handle),
             shards: Vec::with_capacity(num_shards),
             config: config.clone(),
-            wal_config: wal_config.clone(),
+            wal_config,
             flusher_thread: None,
             wal_threads: Vec::with_capacity(num_shards),
             flusher_txs: Vec::with_capacity(num_shards),
@@ -332,6 +339,7 @@ impl LiveWire {
                 .create(true)
                 .write(true)
                 .read(true)
+                .truncate(false)
                 .open(&shard_wal_path)?;
             wal_handle.set_len(16_777_216)?;
             let thread_batch_size = wal_config.max_batch_size;
@@ -486,12 +494,11 @@ impl LiveWire {
                 .min_by_key(|(_, b)| b.last_access)
                 .map(|(&id, _)| id);
 
-            if let Some(vid) = victim_id {
-                if let Some(entry) = shard.pool.remove(&vid) {
-                    if entry.is_dirty {
-                        let _ = self.flusher_txs[shard_idx].send((vid, entry.data));
-                    }
-                }
+            if let Some(vid) = victim_id
+                && let Some(entry) = shard.pool.remove(&vid)
+                && entry.is_dirty
+            {
+                let _ = self.flusher_txs[shard_idx].send((vid, entry.data));
             }
         }
 
@@ -529,22 +536,23 @@ impl LiveWire {
             let local_idx = (raw_block_id as usize) % blocks_per_shard;
             let block_id = (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
 
-            if let Ok(entry) = self.get_or_fetch_block(&mut shard, shard_idx, block_id, local_idx) {
-                if let Some(idx) = entry.data.find_slot(key, start_slot) {
-                    let slot = &entry.data.slots[idx];
+            if let Ok(entry) = self.get_or_fetch_block(&mut shard, shard_idx, block_id, local_idx)
+                && let Some(idx) = entry.data.find_slot(key, start_slot)
+            {
+                let slot = &entry.data.slots[idx];
 
-                    // Found it
-                    if slot.key == key {
-                        return Some(slot.payload);
-                    }
+                // Found it
+                if slot.key == key {
+                    return Some(slot.payload);
+                }
 
-                    // Exit early if we found an empty slot AND the block isn't "Full".
-                    if slot.key == 0 && entry.data.count <= 3500 {
-                        return None;
-                    }
+                // Exit early if we found an empty slot AND the block isn't "Full".
+                if slot.key == 0 && entry.data.count <= 3500 {
+                    return None;
                 }
             }
         }
+
         None
     }
 
@@ -622,10 +630,7 @@ impl LiveWire {
             }
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Total Database Overflow!",
-        ))
+        Err(std::io::Error::other("Total Database Overflow!"))
     }
 
     pub fn sync(&self) -> std::io::Result<()> {
@@ -657,7 +662,6 @@ impl LiveWire {
     }
 
     fn recover_from_wal_shard(&mut self, shard_idx: usize, wal_handle: &mut File) {
-        let mut recovered_keys = 0;
         let mut read_buffer = [0u8; 4096];
         let shard_arc = &self.shards[shard_idx];
         let mut shard = shard_arc.write();
@@ -676,8 +680,6 @@ impl LiveWire {
 
             for entry in entries.iter() {
                 if entry.key != 0 {
-                    recovered_keys += 1;
-
                     for region in 0..self.config.region_count {
                         let effective_key = entry.key ^ (region.wrapping_mul(WALTONS_CONSTANT));
                         let (raw_block_id, start_slot) = self.predict_location(effective_key);
@@ -717,13 +719,6 @@ impl LiveWire {
                     }
                 }
             }
-        }
-
-        if recovered_keys > 0 {
-            println!(
-                "Shard {}: Recovered {} keys from WAL",
-                shard_idx, recovered_keys
-            );
         }
     }
 
@@ -933,10 +928,7 @@ impl LiveWire {
             }
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Total Database Overflow!",
-        ))
+        Err(std::io::Error::other("Total Database Overflow!"))
     }
 }
 
@@ -977,10 +969,10 @@ impl Drop for LiveWire {
             for shard_lock in &self.shards {
                 let shard = shard_lock.read();
                 for meta in &shard.directory {
-                    if let Err(_) = writer.write_all(&meta.count.to_le_bytes()) {
+                    if writer.write_all(&meta.count.to_le_bytes()).is_err() {
                         break;
                     }
-                    if let Err(_) = writer.write_all(&*meta.bloom) {
+                    if writer.write_all(&*meta.bloom).is_err() {
                         break;
                     }
                 }
@@ -1071,7 +1063,7 @@ impl JsonStore {
 
         if flags == FLAG_OVERFLOW {
             let remaining = total_len - INLINE_DATA_SIZE;
-            let num_chunks = (remaining + OVERFLOW_CHUNK_SIZE - 1) / OVERFLOW_CHUNK_SIZE;
+            let num_chunks = remaining.div_ceil(OVERFLOW_CHUNK_SIZE);
 
             for i in 0..num_chunks {
                 let chunk_payload = self.inner.get(overflow_key(hash, i as u64))?;
@@ -1094,7 +1086,7 @@ impl JsonStore {
 
             if flags == FLAG_OVERFLOW && total_len > INLINE_DATA_SIZE {
                 let remaining = total_len - INLINE_DATA_SIZE;
-                let num_chunks = (remaining + OVERFLOW_CHUNK_SIZE - 1) / OVERFLOW_CHUNK_SIZE;
+                let num_chunks = remaining.div_ceil(OVERFLOW_CHUNK_SIZE);
                 let empty = [0u8; 55];
                 for i in 0..num_chunks {
                     self.inner.put(overflow_key(hash, i as u64), empty)?;

@@ -4,6 +4,8 @@ use rayon::prelude::*;
 use std::{env, path::PathBuf, sync::Arc, time::Instant};
 
 fn main() {
+    let num_shards = ((num_cpus::get() * 2) + 1).min(65);
+    println!("Using {num_shards} shards");
     let data_path: PathBuf = env::var("LIVE_WIRE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./data"));
@@ -15,14 +17,11 @@ fn main() {
 
     let live_wire_config = LiveWireConfig {
         data_dir: abs_path,
-        num_shards: 16,
-        pool_capacity: 8192,
+        num_shards,
+        pool_capacity: 16384,
         ..Default::default()
     };
-    let wal_config = WalConfig {
-        mode: Durability::Strict,
-        max_batch_size: 8192,
-    };
+    let wal_config = WalConfig::default();
 
     let live_wire = Arc::new(
         LiveWire::new(live_wire_config, wal_config).expect("Failed to initialize LiveWire"),
@@ -53,8 +52,7 @@ fn main() {
 
     // Sustained load test
     let total = 10_000_000;
-    let batch = 100_000;
-    let num_shards = 16;
+    let batch = 1_000_000;
 
     println!(
         "\n{}",
@@ -70,8 +68,9 @@ fn main() {
         let range: Vec<usize> = ((b * batch)..((b + 1) * batch)).collect();
         range.par_chunks(2048).for_each(|chunk| {
             // Thread-local queues for each shard
-            let mut shard_queues: Vec<Vec<(u64, [u8; 55])>> =
-                vec![Vec::with_capacity(256); num_shards];
+            let mut shard_queues: Vec<Vec<(u64, [u8; 55])>> = (0..num_shards)
+                .map(|_| Vec::with_capacity(256))
+                .collect::<Vec<_>>();
 
             // Hash and build payloads
             for &id in chunk {
