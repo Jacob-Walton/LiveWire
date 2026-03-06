@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use std::{env, path::PathBuf, sync::Arc, time::Instant};
 
 fn main() {
-    let num_shards = ((num_cpus::get() * 2) + 1).min(65);
+    let num_shards = num_cpus::get().min(32);
     println!("Using {num_shards} shards");
     let data_path: PathBuf = env::var("LIVE_WIRE_PATH")
         .map(PathBuf::from)
@@ -21,7 +21,10 @@ fn main() {
         pool_capacity: 16384,
         ..Default::default()
     };
-    let wal_config = WalConfig::default();
+    let wal_config = WalConfig {
+        mode: Durability::Async,
+        ..Default::default()
+    };
 
     let live_wire = Arc::new(
         LiveWire::new(live_wire_config, wal_config).expect("Failed to initialize LiveWire"),
@@ -88,10 +91,12 @@ fn main() {
                 shard_queues[shard_idx].push((hash, payload));
             }
 
-            // Execute batches
+            // Execute batches 
             for (shard_idx, queue) in shard_queues.iter().enumerate() {
                 live_wire.put_batch(shard_idx, queue).unwrap();
             }
+
+            live_wire.flush_wal();
         });
 
         let dur = start.elapsed();

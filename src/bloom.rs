@@ -7,6 +7,7 @@ const BLOOM_SIZE_BITS: u64 = (BLOOM_SIZE_BYTES * 8) as u64;
 pub struct BlockMetadata {
     pub count: u16,
     pub bloom: Box<[u8; BLOOM_SIZE_BYTES]>,
+    pub overflow_block: u64, // 0 = no overflow. Otherwise, global block ID of next block.
 }
 
 impl BlockMetadata {
@@ -14,6 +15,7 @@ impl BlockMetadata {
         Self {
             count: 0,
             bloom: Box::new([0; BLOOM_SIZE_BYTES]),
+            overflow_block: 0,
         }
     }
 

@@ -54,7 +54,7 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             mode: Durability::Strict,
-            max_batch_size: 128,
+            max_batch_size: 8192,
         }
     }
 }

@@ -96,6 +96,9 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
+#[cfg(target_os = "linux")]
+use std::{os::unix::fs::OpenOptionsExt, thread::JoinHandle};
+
 pub use crate::file::*;
 
 pub use serde_json;
@@ -114,6 +117,9 @@ use crate::{
 pub use config::{Durability, LiveWireConfig, WalConfig};
 
 const ERASE_BLOCK_SIZE: usize = 262_144; // 256KB
+
+/// Single WAL file shared across all shards.
+const WAL_FILE_SIZE: u64 = 67_108_864;
 
 pub const TOMBSTONE_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
 
@@ -247,6 +253,7 @@ pub struct DirtyBlock {
 pub struct Shard {
     pub pool: HashMap<u64, DirtyBlock>,
     pub directory: Vec<BlockMetadata>,
+    pub overflow_meta: HashMap<u64, BlockMetadata>,
     pub access_counter: AtomicU64,
 }
 
@@ -256,11 +263,11 @@ pub struct LiveWire {
     pub config: LiveWireConfig,
     pub wal_config: WalConfig,
     pub flusher_thread: Option<thread::JoinHandle<()>>,
-    pub wal_threads: Vec<thread::JoinHandle<()>>,
     pub flusher_txs: Vec<crossbeam_channel::Sender<(u64, AlignedBlock)>>,
-    pub wal_txs: Vec<crossbeam_channel::Sender<(u64, WalEntry)>>,
-    pub global_seqs: Vec<Arc<AtomicU64>>,
-    pub synced_seqs: Vec<Arc<AtomicU64>>,
+    pub wal_thread: Option<thread::JoinHandle<()>>,
+    pub wal_tx: crossbeam_channel::Sender<WalEntry>,
+    pub wal_epoch: Arc<AtomicU64>,
+    pub next_free_block: AtomicU64,
 }
 
 /// Walton's Constant.
@@ -304,11 +311,100 @@ impl LiveWire {
             handle.sync_all()?;
         }
 
-        let _ = handle.try_clone().expect("Failed to clone file handle");
+        #[allow(unused)]
+        let bg_handle = handle.try_clone().expect("Failed to clone file handle");
 
         let total_blocks = (config.region_count * config.blocks_per_region) as usize;
         let num_shards = config.num_shards.max(1);
         let blocks_per_shard = total_blocks / num_shards;
+
+        let (wal_tx, wal_rx) = crossbeam_channel::bounded::<WalEntry>(131_072);
+        let wal_epoch = Arc::new(AtomicU64::new(0));
+
+        let wal_path = config.data_dir.join("main.wal");
+        {
+            let tmp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&wal_path)?;
+            tmp.set_len(WAL_FILE_SIZE)?;
+        }
+
+        #[cfg(windows)]
+        let wal_handle = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(false)
+            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
+            .open(&wal_path)?;
+        #[cfg(target_os = "linux")]
+        let wal_handle = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(false)
+            .custom_flags(libc::O_DSYNC)
+            .open(&wal_path)?;
+
+        #[cfg(target_os = "linux")]
+        enable_direct_io(&wal_handle)?;
+
+        let bg_epoch = Arc::clone(&wal_epoch);
+        let bg_wal_config = wal_config;
+        let wal_thread = thread::spawn(move || {
+            let entry_size = std::mem::size_of::<WalEntry>();
+            let max_batch = bg_wal_config.max_batch_size;
+            let max_bytes = max_batch * entry_size;
+
+            // 4KB-aligned buffer
+            let alloc_size = (max_bytes + 4095) & !4095;
+            let layout = std::alloc::Layout::from_size_align(alloc_size, 4096).unwrap();
+            let io_buffer = unsafe { std::alloc::alloc_zeroed(layout) as *mut WalEntry };
+
+            let mut batch: Vec<WalEntry> = Vec::with_capacity(max_batch);
+            let mut current_offset = 0u64;
+
+            while let Ok(entry) = wal_rx.recv() {
+                batch.push(entry);
+                while batch.len() < max_batch {
+                    match wal_rx.try_recv() {
+                        Ok(e) => batch.push(e),
+                        _ => break,
+                    }
+                }
+
+                let write_bytes = batch.len() * entry_size;
+                let write_pages = (write_bytes + 4095) & !4095;
+
+                unsafe {
+                    std::ptr::write_bytes(io_buffer as *mut u8, 0, write_pages);
+                    for (idx, e) in batch.iter().enumerate() {
+                        std::ptr::write(io_buffer.add(idx), *e);
+                    }
+                    let slice = std::slice::from_raw_parts(io_buffer as *const u8, write_pages);
+                    seek_write(&wal_handle, slice, current_offset)
+                        .expect("WAL write failed");
+                }
+
+                // On Windows, FILE_FLAG_WRITE_THROUGH alone doesn't
+                // guarantee FUA. Explicit sync_data() forces the 
+                // drive to commit.
+                #[cfg(windows)]
+                if bg_wal_config.mode == Durability::Strict {
+                    wal_handle.sync_data().expect("WAL sync failed");
+                }
+
+                current_offset = (current_offset + write_pages as u64) % WAL_FILE_SIZE;
+
+                // Advance the epoch
+                bg_epoch.fetch_add(1, Ordering::Release);
+                batch.clear();
+            }
+
+            unsafe { std::alloc::dealloc(io_buffer as *mut u8, layout); }
+        });
 
         let mut engine = Self {
             handle: Arc::new(handle),
@@ -316,94 +412,24 @@ impl LiveWire {
             config: config.clone(),
             wal_config,
             flusher_thread: None,
-            wal_threads: Vec::with_capacity(num_shards),
             flusher_txs: Vec::with_capacity(num_shards),
-            wal_txs: Vec::with_capacity(num_shards),
-            global_seqs: Vec::with_capacity(num_shards),
-            synced_seqs: Vec::with_capacity(num_shards),
+            wal_thread: Some(wal_thread),
+            wal_tx,
+            wal_epoch,
+            next_free_block: AtomicU64::new(total_blocks as u64),
         };
 
         let mut shard_receivers = Vec::with_capacity(num_shards);
 
-        for i in 0..num_shards {
+        for _ in 0..num_shards {
             let (f_tx, f_rx) = crossbeam_channel::bounded::<(u64, AlignedBlock)>(128);
-            let (w_tx, w_rx) = crossbeam_channel::bounded::<(u64, WalEntry)>(65_536);
             shard_receivers.push(f_rx);
-
-            let synced_seq = Arc::new(AtomicU64::new(0));
-            let global_seq = Arc::new(AtomicU64::new(0));
-            let bg_synced = Arc::clone(&synced_seq);
-
-            let shard_wal_path = config.data_dir.join(format!("shard_{}.wal", i));
-            let wal_handle = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .truncate(false)
-                .open(&shard_wal_path)?;
-            wal_handle.set_len(16_777_216)?;
-            let thread_batch_size = wal_config.max_batch_size;
-
-            let wal_thread = thread::spawn(move || {
-                let mut batch = Vec::with_capacity(thread_batch_size);
-                let mut current_wal_offset = 0u64;
-
-                // Dynamic sizing based on max_batch_size
-                let entry_size = std::mem::size_of::<WalEntry>();
-                let max_bytes = thread_batch_size * entry_size;
-
-                // Round up to the nearest 4KB page for O_DIRECT alignment
-                let alloc_size = (max_bytes + 4095) & !4095;
-
-                let layout = std::alloc::Layout::from_size_align(alloc_size, 4096).unwrap();
-                let io_buffer = unsafe { std::alloc::alloc_zeroed(layout) as *mut WalEntry };
-
-                while let Ok((seq_id, entry)) = w_rx.recv() {
-                    batch.push((seq_id, entry));
-
-                    while batch.len() < thread_batch_size {
-                        match w_rx.try_recv() {
-                            Ok((s, e)) => batch.push((s, e)),
-                            _ => break,
-                        }
-                    }
-
-                    // Calculate exactly how many 4KB pages we need for this specific batch
-                    let write_bytes = batch.len() * entry_size;
-                    let write_pages = (write_bytes + 4095) & !4095;
-
-                    unsafe {
-                        // Only zero out the pages we are about to use to save CPU cycles
-                        std::ptr::write_bytes(io_buffer as *mut u8, 0, write_pages);
-
-                        for (idx, (_, e)) in batch.iter().enumerate() {
-                            std::ptr::write(io_buffer.add(idx), *e);
-                        }
-
-                        let slice = std::slice::from_raw_parts(io_buffer as *const u8, write_pages);
-                        seek_write(&wal_handle, slice, current_wal_offset).expect("WAL write fail");
-                    }
-
-                    current_wal_offset = (current_wal_offset + write_pages as u64) % 16_777_216;
-                    bg_synced.store(batch.last().unwrap().0, Ordering::Release);
-                    batch.clear();
-                }
-
-                unsafe {
-                    std::alloc::dealloc(io_buffer as *mut u8, layout);
-                }
-            });
-
-            engine.wal_threads.push(wal_thread);
             engine.flusher_txs.push(f_tx);
-            engine.wal_txs.push(w_tx);
-            engine.synced_seqs.push(synced_seq);
-            engine.global_seqs.push(global_seq);
-
             engine.shards.push(Arc::new(parking_lot::RwLock::new(Shard {
                 pool: HashMap::default(),
                 directory: vec![BlockMetadata::new(); blocks_per_shard],
                 access_counter: AtomicU64::new(0),
+                overflow_meta: HashMap::default(),
             })));
         }
 
@@ -418,6 +444,9 @@ impl LiveWire {
         if let Ok(meta_file) = File::open(meta_path) {
             let mut reader = BufReader::new(meta_file);
             let mut count_buf = [0u8; 2];
+            let mut overflow_ptr_buf = [0u8; 8];
+            let mut block_id_buf = [0u8; 8];
+
             for shard_lock in &engine.shards {
                 let mut shard = shard_lock.write();
                 for i in 0..blocks_per_shard {
@@ -428,16 +457,51 @@ impl LiveWire {
                     if reader.read_exact(&mut *shard.directory[i].bloom).is_err() {
                         break;
                     }
+                    if reader.read_exact(&mut overflow_ptr_buf).is_ok() {
+                        shard.directory[i].overflow_block = u64::from_le_bytes(overflow_ptr_buf);
+                    }
+                }
+
+                // Overflow metadata
+                let mut of_count_buf = [0u8; 8];
+                if reader.read_exact(&mut of_count_buf).is_ok() {
+                    let overflow_count = u64::from_le_bytes(of_count_buf) as usize;
+                    for _ in 0..overflow_count {
+                        if reader.read_exact(&mut block_id_buf).is_err() {
+                            break;
+                        }
+                        let block_id = u64::from_le_bytes(block_id_buf);
+                        let mut meta = BlockMetadata::new();
+                        if reader.read_exact(&mut count_buf).is_err() {
+                            break;
+                        }
+                        meta.count = u16::from_le_bytes(count_buf);
+                        if reader.read_exact(&mut *meta.bloom).is_err() {
+                            break;
+                        }
+                        if reader.read_exact(&mut overflow_ptr_buf).is_err() {
+                            break;
+                        }
+                        meta.overflow_block = u64::from_le_bytes(overflow_ptr_buf);
+                        shard.overflow_meta.insert(block_id, meta);
+                    }
+                }
+            }
+
+            // Restore next_free_block
+            let mut nfb_buf = [0u8; 8];
+            if reader.read_exact(&mut nfb_buf).is_ok() {
+                let saved = u64::from_le_bytes(nfb_buf);
+                if saved > engine.next_free_block.load(Ordering::Relaxed) {
+                    engine.next_free_block.store(saved, Ordering::Relaxed);
                 }
             }
         }
 
-        // Sharded recovery
-        for i in 0..num_shards {
-            let shard_wal_path = config.data_dir.join(format!("shard_{}.wal", i));
-            if let Ok(mut wal_file) = File::open(shard_wal_path) {
-                engine.recover_from_wal_shard(i, &mut wal_file);
-            }
+        // Recover from WAL file.
+        let wal_recovery_path = config.data_dir.join("main.wal");
+        if let Ok(mut wal_file) = File::open(wal_recovery_path) {
+            engine.recover_from_wal(&mut wal_file);
         }
 
         Ok(engine)
@@ -478,6 +542,7 @@ impl LiveWire {
         shard_idx: usize,
         block_id: u64,
         local_idx: usize,
+        is_overflow: bool,
     ) -> std::io::Result<&'a mut DirtyBlock> {
         if shard.pool.contains_key(&block_id) {
             let entry = shard.pool.get_mut(&block_id).unwrap();
@@ -503,7 +568,15 @@ impl LiveWire {
         }
 
         let mut block = AlignedBlock::new();
-        if shard.directory[local_idx].count > 0 {
+        let has_data = if is_overflow {
+            shard
+                .overflow_meta
+                .get(&block_id)
+                .map_or(false, |m| m.count > 0)
+        } else {
+            shard.directory[local_idx].count > 0
+        };
+        if has_data {
             let offset = block_id * (ERASE_BLOCK_SIZE as u64);
             let _ = seek_read(&self.handle, block.as_mut_slice_u8(), offset);
         }
@@ -536,7 +609,8 @@ impl LiveWire {
             let local_idx = (raw_block_id as usize) % blocks_per_shard;
             let block_id = (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
 
-            if let Ok(entry) = self.get_or_fetch_block(&mut shard, shard_idx, block_id, local_idx)
+            if let Ok(entry) =
+                self.get_or_fetch_block(&mut shard, shard_idx, block_id, local_idx, false)
                 && let Some(idx) = entry.data.find_slot(key, start_slot)
             {
                 let slot = &entry.data.slots[idx];
@@ -546,11 +620,34 @@ impl LiveWire {
                     return Some(slot.payload);
                 }
 
-                // Exit early if we found an empty slot AND the block isn't "Full".
+                // Exit early if we found an empty slot AND the block isn't "full".
                 if slot.key == 0 && entry.data.count <= 3500 {
                     return None;
                 }
             }
+        }
+
+        // Overflow chain from region-0 block
+        let (r0_block, _) = self.predict_location(key);
+        let r0_local_idx = (r0_block as usize) % blocks_per_shard;
+        let mut overflow_id = shard.directory[r0_local_idx].overflow_block;
+
+        while overflow_id != 0 {
+            if let Ok(entry) = self.get_or_fetch_block(&mut shard, shard_idx, overflow_id, 0, true)
+            {
+                if let Some(idx) = entry.data.find_slot(key, 0) {
+                    if entry.data.slots[idx].key == key {
+                        return Some(entry.data.slots[idx].payload);
+                    }
+                    if entry.data.slots[idx].key == 0 && entry.data.count <= 3500 {
+                        return None;
+                    }
+                }
+            }
+            overflow_id = shard
+                .overflow_meta
+                .get(&overflow_id)
+                .map_or(0, |m| m.overflow_block);
         }
 
         None
@@ -567,21 +664,18 @@ impl LiveWire {
     pub fn put(&self, key: u64, data: [u8; 55]) -> std::io::Result<()> {
         let shard_idx = (key % self.shards.len() as u64) as usize;
 
-        let seq_id = self.global_seqs[shard_idx].fetch_add(1, Ordering::Relaxed);
-        let _ = self.wal_txs[shard_idx].send((
-            seq_id,
-            WalEntry {
+        // In Strict mode, log to WAL first and spin until the
+        // epoch advances.
+        // In Async mode, skip the WAL entirely.
+        if self.wal_config.mode == Durability::Strict {
+            let epoch_before = self.wal_epoch.load(Ordering::Acquire);
+            let _ = self.wal_tx.send(WalEntry {
                 key,
                 is_tombstone: false,
                 payload: data,
-            },
-        ));
-
-        // Durability wait
-        if self.wal_config.mode == Durability::Strict {
-            let synced_ptr = &self.synced_seqs[shard_idx];
-            while synced_ptr.load(Ordering::Acquire) < seq_id {
-                std::hint::spin_loop();
+            });
+            while self.wal_epoch.load(Ordering::Acquire) <= epoch_before {
+                std::thread::yield_now();
             }
         }
 
@@ -606,7 +700,7 @@ impl LiveWire {
             }
 
             let entry =
-                self.get_or_fetch_block(&mut shard, shard_idx, global_block_id, local_idx)?;
+                self.get_or_fetch_block(&mut shard, shard_idx, global_block_id, local_idx, false)?;
 
             if let Some(slot_idx) = entry.data.find_slot(key, start_slot) {
                 let is_empty_slot = entry.data.slots[slot_idx].key == 0;
@@ -630,7 +724,108 @@ impl LiveWire {
             }
         }
 
-        Err(std::io::Error::other("Total Database Overflow!"))
+        let total_blocks = self.config.region_count * self.config.blocks_per_region;
+        let blocks_per_shard = (total_blocks / self.shards.len() as u64) as usize;
+
+        // Before overflowing, re-check all primary blocks for key itself.
+        // Prevents stale copy.
+        for region in 0..self.config.region_count {
+            let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
+            let (raw_block_id, start_slot) = self.predict_location(effective_key);
+            let local_idx = (raw_block_id as usize) % blocks_per_shard;
+            let global_block_id = (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+
+            // Only check blocks whose bloom filter says the key might exist
+            if !shard.directory[local_idx].might_contain(key) {
+                continue;
+            }
+
+            let entry =
+                self.get_or_fetch_block(&mut shard, shard_idx, global_block_id, local_idx, false)?;
+            if let Some(slot_idx) = entry.data.find_slot(key, start_slot) {
+                if entry.data.slots[slot_idx].key == key {
+                    // Key exists in a primary block, update in-place
+                    entry.data.slots[slot_idx].payload = data;
+                    entry.is_dirty = true;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Overflow chain
+        let (r0_block, _) = self.predict_location(key);
+        let r0_local_idx = (r0_block as usize) % blocks_per_shard;
+        let r0_global = (shard_idx as u64 * blocks_per_shard as u64) + r0_local_idx as u64;
+
+        // Track previous block so we can set its overflow pointer
+        let mut prev_is_primary = true;
+        let mut prev_block_id: u64 = r0_global;
+        let prev_local_idx: usize = r0_local_idx;
+        let mut current_overflow: u64 = shard.directory[r0_local_idx].overflow_block;
+
+        // Walk existing overflow chain looking for space
+        while current_overflow != 0 {
+            let entry =
+                self.get_or_fetch_block(&mut shard, shard_idx, current_overflow, 0, true)?;
+
+            if let Some(slot_idx) = entry.data.find_slot(key, 0) {
+                let slot_key = entry.data.slots[slot_idx].key;
+
+                // Found the key (update) or an empty slot in a non-full block (insert)
+                if slot_key == key {
+                    entry.data.slots[slot_idx].payload = data;
+                    entry.is_dirty = true;
+                    return Ok(());
+                }
+                if slot_key == 0 && entry.data.count <= 3500 {
+                    entry.data.count += 1;
+                    entry.data.slots[slot_idx].key = key;
+                    entry.data.slots[slot_idx].payload = data;
+                    entry.is_dirty = true;
+                    let meta = shard.overflow_meta.get_mut(&current_overflow).unwrap();
+                    meta.count += 1;
+                    meta.insert(key);
+                    return Ok(());
+                }
+            }
+
+            // This overflow block is also full, keep walking
+            prev_is_primary = false;
+            prev_block_id = current_overflow;
+            current_overflow = shard
+                .overflow_meta
+                .get(&current_overflow)
+                .map_or(0, |m| m.overflow_block);
+        }
+
+        // No space anywhere, allocate a new overflow block
+        let new_block_id = self.alloc_overflow_block()?;
+
+        // Link it from the previous block's overflow pointer
+        if prev_is_primary {
+            shard.directory[prev_local_idx].overflow_block = new_block_id;
+        } else {
+            shard
+                .overflow_meta
+                .get_mut(&prev_block_id)
+                .unwrap()
+                .overflow_block = new_block_id;
+        }
+
+        // Create metadata for new block
+        let mut new_meta = BlockMetadata::new();
+        new_meta.count = 1;
+        new_meta.insert(key);
+        shard.overflow_meta.insert(new_block_id, new_meta);
+
+        // Fetch the new (zeroed) block and write the first slot
+        let entry = self.get_or_fetch_block(&mut shard, shard_idx, new_block_id, 0, true)?;
+        entry.data.slots[0].key = key;
+        entry.data.slots[0].payload = data;
+        entry.data.count = 1;
+        entry.is_dirty = true;
+
+        Ok(())
     }
 
     pub fn sync(&self) -> std::io::Result<()> {
@@ -661,60 +856,158 @@ impl LiveWire {
         }
     }
 
-    fn recover_from_wal_shard(&mut self, shard_idx: usize, wal_handle: &mut File) {
-        let mut read_buffer = [0u8; 4096];
-        let shard_arc = &self.shards[shard_idx];
-        let mut shard = shard_arc.write();
-
+    /// Recover from WAL file.
+    fn recover_from_wal(&mut self, wal_handle: &mut File) {
+        let num_shards = self.shards.len();
         let total_blocks = (self.config.region_count * self.config.blocks_per_region) as usize;
-        let blocks_per_shard = total_blocks / self.shards.len();
+        let blocks_per_shard = total_blocks / num_shards;
+        let wal_pages = (WAL_FILE_SIZE as usize) / 4096;
 
-        for page in 0..4096 {
+        // Read all entries and group by shard.
+        // This avoids constantly locking/unlocking different shards.
+        let mut shard_entries: Vec<Vec<WalEntry>> =
+            (0..num_shards).map(|_| Vec::new()).collect();
+
+        let mut read_buffer = [0u8; 4096];
+        for page in 0..wal_pages {
             let offset = (page * 4096) as u64;
-            let bytes_read = seek_read(wal_handle, &mut read_buffer, offset).unwrap();
+            let bytes_read = seek_read(wal_handle, &mut read_buffer, offset).unwrap_or(0);
             if bytes_read < 4096 {
                 continue;
             }
 
             let entries: &[WalEntry; 64] = unsafe { std::mem::transmute(&read_buffer) };
-
             for entry in entries.iter() {
-                if entry.key != 0 {
-                    for region in 0..self.config.region_count {
-                        let effective_key = entry.key ^ (region.wrapping_mul(WALTONS_CONSTANT));
-                        let (raw_block_id, start_slot) = self.predict_location(effective_key);
+                if entry.key == 0 {
+                    continue;
+                }
+                let shard_idx = (entry.key % num_shards as u64) as usize;
+                shard_entries[shard_idx].push(*entry);
+            }
+        }
 
-                        let local_idx = (raw_block_id as usize) % blocks_per_shard;
-                        let global_block_id =
-                            (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+        // Replay each shard's entries while holding that shard's lock.
+        for (shard_idx, entries) in shard_entries.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
 
-                        if let Ok(block_entry) = self.get_or_fetch_block(
-                            &mut shard,
-                            shard_idx,
-                            global_block_id,
-                            local_idx,
-                        ) {
-                            if block_entry.data.count > 3500 {
-                                continue;
+            let shard_arc = &self.shards[shard_idx];
+            let mut shard = shard_arc.write();
+
+            for entry in &entries {
+                let key = entry.key;
+                let mut inserted = false;
+
+                for region in 0..self.config.region_count {
+                    let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
+                    let (raw_block_id, start_slot) = self.predict_location(effective_key);
+
+                    let local_idx = (raw_block_id as usize) % blocks_per_shard;
+                    let global_block_id =
+                        (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+
+                    if let Ok(block_entry) = self.get_or_fetch_block(
+                        &mut shard,
+                        shard_idx,
+                        global_block_id,
+                        local_idx,
+                        false,
+                    ) {
+                        if block_entry.data.count > 3500 {
+                            continue;
+                        }
+
+                        if let Some(slot_idx) = block_entry.data.find_slot(key, start_slot) {
+                            let is_empty_slot = block_entry.data.slots[slot_idx].key == 0;
+
+                            block_entry.data.slots[slot_idx].key = key;
+                            block_entry.data.slots[slot_idx].payload = entry.payload;
+                            block_entry.is_dirty = true;
+
+                            if is_empty_slot {
+                                block_entry.data.count += 1;
+                                shard.directory[local_idx].count += 1;
                             }
 
-                            if let Some(slot_idx) =
-                                block_entry.data.find_slot(entry.key, start_slot)
-                            {
-                                let is_empty_slot = block_entry.data.slots[slot_idx].key == 0;
+                            shard.directory[local_idx].insert(key);
+                            inserted = true;
+                            break;
+                        }
+                    }
+                }
 
-                                block_entry.data.slots[slot_idx].key = entry.key;
+                if inserted {
+                    continue;
+                }
+
+                // Overflow chain from region-0 block
+                let (r0_block, _) = self.predict_location(key);
+                let r0_local_idx = (r0_block as usize) % blocks_per_shard;
+
+                let mut prev_is_primary = true;
+                let mut prev_block_id: u64 =
+                    (shard_idx as u64 * blocks_per_shard as u64) + r0_local_idx as u64;
+                let prev_local_idx: usize = r0_local_idx;
+                let mut current_overflow: u64 = shard.directory[r0_local_idx].overflow_block;
+
+                while current_overflow != 0 {
+                    if let Ok(block_entry) =
+                        self.get_or_fetch_block(&mut shard, shard_idx, current_overflow, 0, true)
+                    {
+                        if let Some(slot_idx) = block_entry.data.find_slot(key, 0) {
+                            let slot_key = block_entry.data.slots[slot_idx].key;
+                            if slot_key == key {
                                 block_entry.data.slots[slot_idx].payload = entry.payload;
                                 block_entry.is_dirty = true;
-
-                                if is_empty_slot {
-                                    block_entry.data.count += 1;
-                                    shard.directory[local_idx].count += 1;
-                                }
-
-                                shard.directory[local_idx].insert(entry.key);
+                                inserted = true;
                                 break;
                             }
+                            if slot_key == 0 && block_entry.data.count <= 3500 {
+                                block_entry.data.count += 1;
+                                block_entry.data.slots[slot_idx].key = key;
+                                block_entry.data.slots[slot_idx].payload = entry.payload;
+                                block_entry.is_dirty = true;
+                                let meta = shard.overflow_meta.get_mut(&current_overflow).unwrap();
+                                meta.count += 1;
+                                meta.insert(key);
+                                inserted = true;
+                                break;
+                            }
+                        }
+                    }
+                    prev_is_primary = false;
+                    prev_block_id = current_overflow;
+                    current_overflow = shard
+                        .overflow_meta
+                        .get(&current_overflow)
+                        .map_or(0, |m| m.overflow_block);
+                }
+
+                if !inserted {
+                    if let Ok(new_block_id) = self.alloc_overflow_block() {
+                        if prev_is_primary {
+                            shard.directory[prev_local_idx].overflow_block = new_block_id;
+                        } else {
+                            shard
+                                .overflow_meta
+                                .get_mut(&prev_block_id)
+                                .unwrap()
+                                .overflow_block = new_block_id;
+                        }
+
+                        let mut new_meta = BlockMetadata::new();
+                        new_meta.count = 1;
+                        new_meta.insert(key);
+                        shard.overflow_meta.insert(new_block_id, new_meta);
+
+                        if let Ok(block_entry) =
+                            self.get_or_fetch_block(&mut shard, shard_idx, new_block_id, 0, true)
+                        {
+                            block_entry.data.slots[0].key = key;
+                            block_entry.data.slots[0].payload = entry.payload;
+                            block_entry.data.count = 1;
+                            block_entry.is_dirty = true;
                         }
                     }
                 }
@@ -820,48 +1113,48 @@ impl LiveWire {
         }
     }
 
-    /// Puts the data into the engine and returns the sequence ID for later syncing
-    pub fn put_async(&self, key: u64, data: [u8; 55]) -> std::io::Result<(usize, u64)> {
+    /// Fire-and-forget write. Queues to WAL and inserts to memory
+    /// immediately without waiting for the physical sync.
+    /// Call flush_wal() later to guarantee durability.
+    pub fn put_async(&self, key: u64, data: [u8; 55]) -> std::io::Result<()> {
         let shard_idx = (key % self.shards.len() as u64) as usize;
 
-        let seq_id = self.global_seqs[shard_idx].fetch_add(1, Ordering::Relaxed);
-        let _ = self.wal_txs[shard_idx].send((
-            seq_id,
-            WalEntry {
+        // Only log to WAL in Strict mode. Async skips the
+        // channel entirely to avoid back-pressure.
+        if self.wal_config.mode == Durability::Strict {
+            let _ = self.wal_tx.send(WalEntry {
                 key,
                 is_tombstone: false,
                 payload: data,
-            },
-        ));
+            });
+        }
 
-        // Do the memory insert immediately without waiting for disk
+        // Memory insert immediately
         let mut shard = self.shards[shard_idx].write();
         self.insert_to_memory(&mut shard, shard_idx, key, data)?;
 
-        Ok((shard_idx, seq_id))
+        Ok(())
     }
 
-    /// Vectorized memory insert. Grabs the RwLock once for an entire batch of documents.
+    /// Vectorized write. Queues entries to the WAL and inserts
+    /// to memory in one shot. Does NOT block for the physical
+    /// sync, call flush_wal() after submitting all shards.
     pub fn put_batch(&self, shard_idx: usize, entries: &[(u64, [u8; 55])]) -> std::io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
-        // Queue all to WAL lock-free
-        let start_seq =
-            self.global_seqs[shard_idx].fetch_add(entries.len() as u64, Ordering::Relaxed);
-        for (i, &(key, payload)) in entries.iter().enumerate() {
-            let _ = self.wal_txs[shard_idx].send((
-                start_seq + i as u64,
-                WalEntry {
+        if self.wal_config.mode == Durability::Strict {
+            for &(key, payload) in entries {
+                let _ = self.wal_tx.send(WalEntry {
                     key,
                     is_tombstone: false,
                     payload,
-                },
-            ));
+                });
+            }
         }
 
-        // One lock for the entire batch
+        // Grab the shard lock once for the entire batch
         let mut shard = self.shards[shard_idx].write();
         for &(key, payload) in entries {
             self.insert_to_memory(&mut shard, shard_idx, key, payload)?;
@@ -870,11 +1163,24 @@ impl LiveWire {
         Ok(())
     }
 
-    /// Waits for a specific sequence ID to hit the metal
-    pub fn wait_sync(&self, shard_idx: usize, seq_id: u64) {
-        let synced_ptr = &self.synced_seqs[shard_idx];
-        while synced_ptr.load(Ordering::Acquire) < seq_id {
-            // Yield the core so the WAL thread can actually run
+    /// Blocks until every WAL entry sent before
+    /// this call is physically on the device.
+    pub fn flush_wal(&self) {
+        if self.wal_config.mode != Durability::Strict {
+            return;
+        }
+
+        // Read epoch before sending.
+        let epoch_before = self.wal_epoch.load(Ordering::Acquire);
+        let _ = self.wal_tx.send(WalEntry {
+            key: 0,
+            is_tombstone: false,
+            payload: [0u8; 55],
+        });
+
+        // Spin until the epoch advances. When it does, at least
+        // one full batch (including our fence) has been synced.
+        while self.wal_epoch.load(Ordering::Acquire) <= epoch_before {
             std::thread::yield_now();
         }
     }
@@ -904,7 +1210,8 @@ impl LiveWire {
                 continue;
             }
 
-            let entry = self.get_or_fetch_block(shard, shard_idx, global_block_id, local_idx)?;
+            let entry =
+                self.get_or_fetch_block(shard, shard_idx, global_block_id, local_idx, false)?;
 
             if let Some(slot_idx) = entry.data.find_slot(key, start_slot) {
                 let is_empty_slot = entry.data.slots[slot_idx].key == 0;
@@ -928,7 +1235,108 @@ impl LiveWire {
             }
         }
 
-        Err(std::io::Error::other("Total Database Overflow!"))
+        // Dedup check
+        let total_blocks = self.config.region_count * self.config.blocks_per_region;
+        let blocks_per_shard = (total_blocks / self.shards.len() as u64) as usize;
+
+        for region in 0..self.config.region_count {
+            let effective_key = key ^ (region.wrapping_mul(WALTONS_CONSTANT));
+            let (raw_block_id, start_slot) = self.predict_location(effective_key);
+            let local_idx = (raw_block_id as usize) % blocks_per_shard;
+            let global_block_id = (shard_idx as u64 * blocks_per_shard as u64) + local_idx as u64;
+
+            if !shard.directory[local_idx].might_contain(key) {
+                continue;
+            }
+
+            let entry =
+                self.get_or_fetch_block(shard, shard_idx, global_block_id, local_idx, false)?;
+            if let Some(slot_idx) = entry.data.find_slot(key, start_slot) {
+                if entry.data.slots[slot_idx].key == key {
+                    entry.data.slots[slot_idx].payload = data;
+                    entry.is_dirty = true;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Overflow chain from region-0 block
+        let (r0_block, _) = self.predict_location(key);
+        let r0_local_idx = (r0_block as usize) % blocks_per_shard;
+
+        let mut prev_is_primary = true;
+        let mut prev_block_id: u64 =
+            (shard_idx as u64 * blocks_per_shard as u64) + r0_local_idx as u64;
+        let prev_local_idx: usize = r0_local_idx;
+        let mut current_overflow: u64 = shard.directory[r0_local_idx].overflow_block;
+
+        while current_overflow != 0 {
+            let entry = self.get_or_fetch_block(shard, shard_idx, current_overflow, 0, true)?;
+
+            if let Some(slot_idx) = entry.data.find_slot(key, 0) {
+                let slot_key = entry.data.slots[slot_idx].key;
+
+                if slot_key == key {
+                    entry.data.slots[slot_idx].payload = data;
+                    entry.is_dirty = true;
+                    return Ok(());
+                }
+                if slot_key == 0 && entry.data.count <= 3500 {
+                    entry.data.count += 1;
+                    entry.data.slots[slot_idx].key = key;
+                    entry.data.slots[slot_idx].payload = data;
+                    entry.is_dirty = true;
+                    let meta = shard.overflow_meta.get_mut(&current_overflow).unwrap();
+                    meta.count += 1;
+                    meta.insert(key);
+                    return Ok(());
+                }
+            }
+
+            prev_is_primary = false;
+            prev_block_id = current_overflow;
+            current_overflow = shard
+                .overflow_meta
+                .get(&current_overflow)
+                .map_or(0, |m| m.overflow_block);
+        }
+
+        let new_block_id = self.alloc_overflow_block()?;
+
+        if prev_is_primary {
+            shard.directory[prev_local_idx].overflow_block = new_block_id;
+        } else {
+            shard
+                .overflow_meta
+                .get_mut(&prev_block_id)
+                .unwrap()
+                .overflow_block = new_block_id;
+        }
+
+        let mut new_meta = BlockMetadata::new();
+        new_meta.count = 1;
+        new_meta.insert(key);
+        shard.overflow_meta.insert(new_block_id, new_meta);
+
+        let entry = self.get_or_fetch_block(shard, shard_idx, new_block_id, 0, true)?;
+        entry.data.slots[0].key = key;
+        entry.data.slots[0].payload = data;
+        entry.data.count = 1;
+        entry.is_dirty = true;
+
+        Ok(())
+    }
+
+    fn alloc_overflow_block(&self) -> std::io::Result<u64> {
+        let block_id = self.next_free_block.fetch_add(1, Ordering::Relaxed);
+        let required_size = (block_id + 1) * ERASE_BLOCK_SIZE as u64;
+        let current_size = self.handle.metadata()?.len();
+        if required_size > current_size {
+            let grow_chunk = 256 * 1024 * 1024u64; // 256MB at a time
+            let new_size = required_size.next_multiple_of(grow_chunk);
+            self.handle.set_len(new_size)?;
+        }
+        Ok(block_id)
     }
 }
 
@@ -951,15 +1359,21 @@ impl Drop for LiveWire {
             let _ = handle.join();
         }
 
-        self.wal_txs.clear();
-        for handle in self.wal_threads.drain(..) {
+        // Drop the sender to signal the WAL thread to exit,
+        // then join it so all queued entries get flushed.
+        drop(std::mem::replace(
+            &mut self.wal_tx,
+            crossbeam_channel::bounded::<WalEntry>(1).0,
+        ));
+        if let Some(handle) = self.wal_thread.take() {
             let _ = handle.join();
         }
 
+        // Zero out the WAL
         let wal_path = self.config.data_dir.join("main.wal");
         if let Ok(wal_handle) = OpenOptions::new().write(true).open(wal_path) {
             let _ = wal_handle.set_len(0);
-            let _ = wal_handle.set_len(16_777_216);
+            let _ = wal_handle.set_len(WAL_FILE_SIZE);
         }
 
         let meta_path = self.config.data_dir.join("main.meta");
@@ -969,14 +1383,20 @@ impl Drop for LiveWire {
             for shard_lock in &self.shards {
                 let shard = shard_lock.read();
                 for meta in &shard.directory {
-                    if writer.write_all(&meta.count.to_le_bytes()).is_err() {
-                        break;
-                    }
-                    if writer.write_all(&*meta.bloom).is_err() {
-                        break;
-                    }
+                    let _ = writer.write_all(&meta.count.to_le_bytes());
+                    let _ = writer.write_all(&*meta.bloom);
+                    let _ = writer.write_all(&meta.overflow_block.to_le_bytes());
+                }
+                let overflow_count = shard.overflow_meta.len() as u64;
+                let _ = writer.write_all(&overflow_count.to_le_bytes());
+                for (&block_id, meta) in &shard.overflow_meta {
+                    let _ = writer.write_all(&block_id.to_le_bytes());
+                    let _ = writer.write_all(&meta.count.to_le_bytes());
+                    let _ = writer.write_all(&*meta.bloom);
+                    let _ = writer.write_all(&meta.overflow_block.to_le_bytes());
                 }
             }
+            let _ = writer.write_all(&self.next_free_block.load(Ordering::Relaxed).to_le_bytes());
             let _ = writer.flush();
         }
     }

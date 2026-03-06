@@ -2,6 +2,8 @@ use std::fs::File;
 
 #[cfg(windows)]
 pub const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+#[cfg(windows)]
+pub const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
 
 #[cfg(unix)]
 pub const O_DIRECT: i32 = 0o40000;

@@ -15,13 +15,13 @@ All entries are exactly 64 bytes which means that one slot = one CPU cache line.
 
 ### Async
 
-- **PUT**: ~70ns/op (sustained)
-- **GET**: ~170ns/op (sustained)
+- **PUT**: ~65ns/op (sustained)
+- **GET**: ~34ns/op (sustained)
 
 ### Strict
 
-- **PUT**: ~70ns/op (sustained)
-- **GET**: ~170ns/op (sustained)
+- **PUT**: ~229ns/op (sustained)
+- **GET**: ~32ns/op (sustained)
 
 ## Trade-offs
 

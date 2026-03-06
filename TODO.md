@@ -6,3 +6,4 @@
 - [ ] Tombstone compaction / defragmentation
 - [ ] SIMD get_batch
 - [ ] Add Windows/macOS support back
+- [ ] Fix unpredictable performance
