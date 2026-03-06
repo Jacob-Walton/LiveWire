@@ -5,5 +5,5 @@
 - [x] Linux support
 - [ ] Tombstone compaction / defragmentation
 - [ ] SIMD get_batch
-- [ ] Add Windows/macOS support back
-- [ ] Fix unpredictable performance
+- [x] Add Windows/macOS support back
+- [x] Fix unpredictable performance
